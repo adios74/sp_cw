@@ -1,0 +1,29 @@
+# Скомпилированные файлы
+mydb
+*.exe
+*.out
+*.o
+*.obj
+
+# Тестовые файлы
+*.txt
+
+# Сборка
+build/
+cmake-build-*/
+*.cmake
+CMakeCache.txt
+Makefile
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Бэкапы
+*.bak
+*.tmp
+EOF
