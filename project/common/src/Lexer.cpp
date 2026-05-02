@@ -1,7 +1,6 @@
 #include "../include/Lexer.h"
 #include <cctype>
 #include <unordered_map>
-#include <sstream>
 
 Lexer::Lexer(const std::string& input)
     : source(input), pos(0), line(1), column(1), peeked(false)
