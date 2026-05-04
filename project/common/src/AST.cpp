@@ -1,30 +1,41 @@
 #include "../include/AST.h"
 #include <sstream>
 
-// ----------------------------------------------------------
-// Вспомогательные функции вывода
-// ----------------------------------------------------------
 
 std::string valueToString(const Value& v) {
     struct Visitor {
-        std::string operator()(int i) { return std::to_string(i); }
-        std::string operator()(const std::string& s) { return "\"" + s + "\""; }
+        std::string operator()(int i) { 
+            return std::to_string(i); 
+        }
+        std::string operator()(const std::string& s) { 
+            return "\"" + s + "\""; 
+        }
         std::string operator()(const ColumnRef& r) {
             std::ostringstream oss;
-            if (!r.database.empty()) oss << r.database << ".";
-            if (!r.table.empty()) oss << r.table << ".";
+            if (!r.database.empty()) {
+                oss << r.database << ".";
+            }
+            if (!r.table.empty()) {
+                oss << r.table << ".";
+            }
             oss << r.column;
             return oss.str();
         }
-        std::string operator()(std::nullptr_t) { return "NULL"; }
+        std::string operator()(std::nullptr_t) { 
+            return "NULL"; 
+        }
     };
     return std::visit(Visitor{}, v);
 }
 
 std::string selectExprToString(const SelectExpr& se) {
     struct Visitor {
-        std::string operator()(std::monostate) { return "*"; }
-        std::string operator()(const ColumnRef& cr) { return valueToString(cr); }
+        std::string operator()(std::monostate) { 
+            return "*"; 
+        }
+        std::string operator()(const ColumnRef& cr) { 
+            return valueToString(cr); 
+        }
         std::string operator()(const AggCall& ag) {
             std::string funcName;
             switch (ag.func) {
@@ -32,7 +43,6 @@ std::string selectExprToString(const SelectExpr& se) {
                 case AggFunc::COUNT: funcName = "COUNT"; break;
                 case AggFunc::AVG:   funcName = "AVG"; break;
             }
-            // Для COUNT(*) аргумент — nullptr
             if (std::holds_alternative<std::nullptr_t>(ag.arg)) {
                 return funcName + "(*)";
             }
@@ -119,7 +129,7 @@ std::string astToString(const Statement& stmt) {
                 if (i > 0) oss << ", ";
                 oss << s.columns[i];
             }
-            oss << ") VALUES ";
+            oss << ") VALUE ";
             for (size_t i = 0; i < s.values.size(); ++i) {
                 if (i > 0) oss << ", ";
                 oss << "(";
@@ -178,9 +188,6 @@ std::string astToString(const Statement& stmt) {
     return oss.str();
 }
 
-// ----------------------------------------------------------
-// Фабрики для узлов условий
-// ----------------------------------------------------------
 
 std::unique_ptr<Expr> makeComparison(ComparisonOp op, Value left, Value right) {
     auto e = std::make_unique<Expr>();

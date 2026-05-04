@@ -242,9 +242,7 @@ Token Lexer::readOperatorOrPunctuation() {
             return Token(TokenType::OP_EQUAL, opStr, startLine, startCol);
 
         } else {
-            throw std::runtime_error("Lexer error: unexpected '=' at line " +
-                                     std::to_string(line) + ", column " + std::to_string(column-1) +
-                                     " (did you mean '=='?)");
+            return Token(TokenType::OP_ASSIGN, opStr, startLine, startCol);
         }
     } else if (c == '!') {
 
@@ -299,6 +297,8 @@ Token Lexer::readOperatorOrPunctuation() {
     } else if (c == '*') {
         return Token(TokenType::STAR, opStr, startLine, startCol);
 
+    } else if (c == '.') {
+        return Token(TokenType::DOT, opStr, startLine, startCol);
     } else {
         throw std::runtime_error("Lexer error: unexpected character '" + std::string(1, c) +
                                  "' at line " + std::to_string(line) + ", column " + std::to_string(startCol));

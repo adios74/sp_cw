@@ -7,41 +7,35 @@
 #include <variant>
 #include <optional>
 
-// ============================================================
 // Имена таблиц (с опциональной базой данных)
-// ============================================================
 struct TableRef {
-    std::string name;           // имя таблицы
-    std::string database;       // база данных (если пусто — используется текущая)
+    std::string name;
+    std::string database;
 };
 
-// ============================================================
 // Значения (литералы и ссылки на столбцы)
-// ============================================================
 struct ColumnRef {
-    std::string column;         // имя колонки
-    std::string table;          // опционально: table.column
-    std::string database;       // опционально: db.table.column
+    std::string column;
+    std::string table;
+    std::string database;
 };
 
 // Тип значения: число, строка, ссылка на столбец или NULL
 using Value = std::variant<
-    int,                        // INT_LITERAL
-    std::string,                // STRING_LITERAL
-    ColumnRef,                  // имя колонки
-    std::nullptr_t              // NULL
+    int,
+    std::string,
+    ColumnRef,
+    std::nullptr_t
 >;
 
-// ============================================================
 // Условия WHERE
-// ============================================================
 enum class ComparisonOp {
-    EQUAL,              // ==
-    NOT_EQUAL,          // !=
-    LESS,               // <
-    GREATER,            // >
-    LESS_OR_EQUAL,      // <=
-    GREATER_OR_EQUAL    // >=
+    EQUAL,
+    NOT_EQUAL,
+    LESS,
+    GREATER,
+    LESS_OR_EQUAL,
+    GREATER_OR_EQUAL
 };
 
 struct ComparisonExpr {
@@ -58,24 +52,21 @@ struct BetweenExpr {
 
 struct LikeExpr {
     Value val;
-    std::string pattern;   // регулярное выражение
+    std::string pattern;
 };
 
 struct Expr {
     enum Type { COMPARISON, BETWEEN, LIKE, AND, OR, NOT };
     Type type;
 
-    // В зависимости от type активно одно из полей
     ComparisonExpr comparison;
     BetweenExpr between;
     LikeExpr like;
-    std::unique_ptr<Expr> left;    // для AND/OR/NOT
-    std::unique_ptr<Expr> right;   // для AND/OR
+    std::unique_ptr<Expr> left;
+    std::unique_ptr<Expr> right;
 };
 
-// ============================================================
 // Определения столбцов (CREATE TABLE)
-// ============================================================
 enum class ColumnConstraint {
     NONE,
     NOT_NULL,
@@ -84,37 +75,32 @@ enum class ColumnConstraint {
 
 struct ColumnDef {
     std::string name;
-    std::string type;                        // "INT" или "STRING"
+    std::string type;
     ColumnConstraint constraint;
-    std::optional<Value> default_value;      // DEFAULT value
+    std::optional<Value> default_value;
 };
 
-// ============================================================
 // Выражения для списка SELECT (включая агрегатные функции)
-// ============================================================
 enum class AggFunc { SUM, COUNT, AVG };
 
 struct AggCall {
     AggFunc func;
-    // Аргумент: колонка или NULL (для COUNT(*) можно передать nullptr)
     Value arg;
 };
 
 // То, что может стоять после SELECT: звёздочка, колонка, агрегат
 using SelectExpr = std::variant<
-    std::monostate,     // SELECT *
-    ColumnRef,          // SELECT col
-    AggCall             // SELECT SUM(col)
+    std::monostate,
+    ColumnRef,
+    AggCall
 >;
 
 struct SelectColumn {
     SelectExpr expr;
-    std::optional<std::string> alias;   // AS alias
+    std::optional<std::string> alias;
 };
 
-// ============================================================
 // SQL-команды
-// ============================================================
 struct CreateDatabaseStmt {
     std::string name;
 };
@@ -133,31 +119,30 @@ struct CreateTableStmt {
 };
 
 struct DropTableStmt {
-    std::string name;   // можно расширить до TableRef, но проще без базы
+    std::string name;
 };
 
 struct InsertStmt {
     TableRef table;
     std::vector<std::string> columns;
-    std::vector<std::vector<Value>> values;   // множественная вставка
+    std::vector<std::vector<Value>> values;
 };
 
 struct UpdateStmt {
     TableRef table;
     std::vector<std::pair<std::string, Value>> assignments;
-    std::unique_ptr<Expr> condition;          // WHERE обязателен по синтаксису
+    std::unique_ptr<Expr> condition;
 };
 
 struct DeleteStmt {
     TableRef table;
-    std::unique_ptr<Expr> condition;          // WHERE обязателен
+    std::unique_ptr<Expr> condition;
 };
 
 struct SelectStmt {
-    // Если columns пуст — это SELECT *
     std::vector<SelectColumn> columns;
     TableRef table;
-    std::unique_ptr<Expr> condition;          // может отсутствовать (nullptr)
+    std::unique_ptr<Expr> condition;
 };
 
 // Корневой узел AST
@@ -173,9 +158,7 @@ using Statement = std::variant<
     SelectStmt
 >;
 
-// ============================================================
 // Вспомогательные функции (отладка и фабрики)
-// ============================================================
 std::string astToString(const Statement& stmt);
 std::string valueToString(const Value& v);
 std::string exprToString(const Expr* expr);
@@ -189,4 +172,4 @@ std::unique_ptr<Expr> makeAnd(std::unique_ptr<Expr> left, std::unique_ptr<Expr> 
 std::unique_ptr<Expr> makeOr(std::unique_ptr<Expr> left, std::unique_ptr<Expr> right);
 std::unique_ptr<Expr> makeNot(std::unique_ptr<Expr> expr);
 
-#endif // AST_H
+#endif

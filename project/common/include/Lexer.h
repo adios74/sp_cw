@@ -43,12 +43,14 @@ enum class TokenType {
     OP_GREATER,           // >
     OP_LESS_OR_EQUAL,           // <=
     OP_GREATER_OR_EQUAL,           // >=
+    OP_ASSIGN,          // =
 
     COMMA,           // ,
     SEMICOLON,       // ;
     LBRACKET,          // (
     RBRACKET,          // )
     STAR,            // *
+    DOT,
 
     IDENTIFIER,
     INT_LITERAL,
