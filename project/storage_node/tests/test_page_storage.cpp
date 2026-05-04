@@ -677,6 +677,7 @@ TEST_F(IntegrationTest, StressTest) {
         int value = value_dist(gen);
         
         index.insert_value(key, value);
+     
         reference[key] = value;
     }
     
