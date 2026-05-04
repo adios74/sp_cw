@@ -18,6 +18,10 @@
 template <typename tkey, typename tvalue, comparator<tkey> compare = std::less<tkey>, std::size_t t = 5>
 class BP_tree final : private compare
 {
+
+    template<typename Key>
+    friend class PageBasedIndex;
+
 public:
     using tree_data_type = std::pair<tkey, tvalue>;
     using tree_data_type_const = std::pair<const tkey, tvalue>;

@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <cstring>
+#include <optional>
 #include <limits> 
 #include "Index.h" // btree here
 // We are using pages as a nodes of btree for storaging them at disk
@@ -57,6 +58,14 @@ public:
         file_.close();
     }
     
+    void mark_dirty(uint64_t page_id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = cache_.find(page_id);
+        if (it != cache_.end()) {
+            it->second->header.dirty = true;
+        }
+    }
+
     // Загружает страницу в память
     std::shared_ptr<Page> load_page(uint64_t page_id) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -190,7 +199,7 @@ public: // idk about that. all this allocator shit is dubious, if something - i 
     void destroy(U* p) {
         p->~U();
     }
-    
+
     page_aware_allocator(PageManager& pm) noexcept : page_manager_(&pm) {}
     
     template<typename U>
@@ -269,6 +278,12 @@ private:
  
 template<typename Key>
 class PageBasedIndex {
+private:
+    // Вспомогательные структуры для хранения типов
+    using TreeType = BP_tree<Key, uint64_t, std::less<Key>>;
+    using NodeType = typename TreeType::node;
+    using LeafNodeType = typename TreeType::leaf_node;
+    
 public:
     explicit PageBasedIndex(PageManager& pm) 
         : page_manager_(pm), index_() {}
@@ -436,9 +451,7 @@ private:
     }
     
     // Сериализация узла B-дерева в страницу
-    void save_node(typename decltype(index_)::node* node, 
-                   uint64_t& page_id_out,
-                   uint64_t& leaf_head_id_out) {
+    void save_node(NodeType* node, uint64_t& page_id_out, uint64_t& leaf_head_id_out) {
         if (!node) {
             page_id_out = 0;
             return;
@@ -464,7 +477,7 @@ private:
         offset += keys_size;
         
         if (is_leaf) {
-            auto* leaf = static_cast<typename decltype(index_)::leaf_node*>(node);
+            auto* leaf = static_cast<LeafNodeType*>(node);
             
             // Значения (page_id для каждого ключа)
             for (size_t i = 0; i < node->key_count; ++i) {
@@ -476,12 +489,10 @@ private:
             // Указатель на следующий лист
             uint64_t next_id = 0;
             if (leaf->next) {
-                // Сохраняем следующий лист рекурсивно
                 save_node(leaf->next, next_id, leaf_head_id_out);
             }
             memcpy(page->data + offset, &next_id, sizeof(uint64_t));
             
-            // Если это первый лист — запоминаем как голову
             if (!index_._leaf_head || leaf == index_._leaf_head) {
                 leaf_head_id_out = page_id;
             }
@@ -497,13 +508,11 @@ private:
         
         page_manager_.mark_dirty(page_id);
         page_id_out = page_id;
-        
-        // Сохраняем маппинг
         node_page_map_[reinterpret_cast<uintptr_t>(node)] = page_id;
     }
     
     // Десериализация узла из страницы
-    typename decltype(index_)::node* load_node(uint64_t page_id) {
+    NodeType* load_node(uint64_t page_id) {
         if (page_id == 0) return nullptr;
         
         auto page = page_manager_.load_page(page_id);
@@ -521,39 +530,32 @@ private:
         offset += sizeof(size_t);
         node->key_count = key_count;
         
-        // Ключи
         size_t keys_size = key_count * sizeof(Key);
         memcpy(node->keys, page->data + offset, keys_size);
         offset += keys_size;
         
         if (is_leaf) {
-            auto* leaf = static_cast<typename decltype(index_)::leaf_node*>(node);
+            auto* leaf = static_cast<LeafNodeType*>(node);
             
-            // Значения
             for (size_t i = 0; i < key_count; ++i) {
                 uint64_t value_page_id;
                 memcpy(&value_page_id, page->data + offset, sizeof(uint64_t));
                 offset += sizeof(uint64_t);
-                
                 leaf->values[i] = {node->keys[i], value_page_id};
             }
             
-            // Следующий лист
             uint64_t next_id;
             memcpy(&next_id, page->data + offset, sizeof(uint64_t));
-            leaf->next = static_cast<decltype(leaf->next)>(load_node(next_id));
+            leaf->next = static_cast<LeafNodeType*>(load_node(next_id));
             
-            // Устанавливаем голову листьев
             if (!index_._leaf_head) {
                 index_._leaf_head = leaf;
             }
         } else {
-            // Дочерние узлы
             for (size_t i = 0; i <= key_count; ++i) {
                 uint64_t child_id;
                 memcpy(&child_id, page->data + offset, sizeof(uint64_t));
                 offset += sizeof(uint64_t);
-                
                 node->children[i] = load_node(child_id);
             }
         }
@@ -562,11 +564,8 @@ private:
     }
     
     PageManager& page_manager_;
-    BP_tree<Key, uint64_t> index_;  // Ключ → page_id с данными
-    
-    // Маппинг указателей узлов на ID страниц (для сериализации)
-    mutable std::unordered_map<uintptr_t, uint64_t> node_page_map_;
+    TreeType index_;
+    std::unordered_map<uintptr_t, uint64_t> node_page_map_;
 };
-
 
 #endif // PAGE_STORAGE_H

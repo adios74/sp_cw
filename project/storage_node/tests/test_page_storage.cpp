@@ -514,7 +514,7 @@ TEST_F(PageBasedIndexTest, LargeData) {
     
     auto result = index->find_string(1);
     EXPECT_TRUE(result.has_value());
-    EXPECT_EQ(result->value(), large_data);
+    EXPECT_EQ(result.value(), large_data);
 }
 
 TEST_F(PageBasedIndexTest, DataTooLarge) {
