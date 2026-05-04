@@ -37,7 +37,7 @@ protected:
 
 TEST_F(PageStorageTest, PageConfigConstants) {
     EXPECT_EQ(PageConfig::PAGE_SIZE, 4096);
-    EXPECT_EQ(PageConfig::HEADER_SIZE, sizeof(uint64_t));
+    EXPECT_EQ(PageConfig::HEADER_SIZE, sizeof(PageHeader));
     EXPECT_EQ(PageConfig::DATA_SIZE, 4096 - sizeof(uint64_t));
     EXPECT_GT(PageConfig::DATA_SIZE, 0);
 }
