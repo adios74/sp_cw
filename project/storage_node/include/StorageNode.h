@@ -248,3 +248,306 @@ private:
     friend class page_aware_allocator;
 };
  
+template<typename Key>
+class PageBasedIndex {
+public:
+    explicit PageBasedIndex(PageManager& pm) 
+        : page_manager_(pm), index_() {}
+    
+    ~PageBasedIndex() = default;
+    
+    // Вставка сырых данных
+    void insert(const Key& key, const void* data, size_t size) {
+        auto it = index_.find(key);
+        
+        if (it != index_.end()) {
+            // Ключ существует — обновляем данные
+            uint64_t old_page_id = it->second;
+            page_manager_.free_page(old_page_id);
+            
+            uint64_t new_page_id = write_data_to_page(data, size);
+            const_cast<uint64_t&>(it->second) = new_page_id;
+        } else {
+            // Новый ключ
+            uint64_t page_id = write_data_to_page(data, size);
+            index_.insert({key, page_id});
+        }
+    }
+    
+    // Вставка строки
+    void insert_string(const Key& key, const std::string& value) {
+        insert(key, value.data(), value.size());
+    }
+    
+    // Вставка POD типа
+    template<typename T>
+    void insert_value(const Key& key, const T& value) {
+        static_assert(std::is_trivially_copyable_v<T>, "T must be trivially copyable");
+        insert(key, &value, sizeof(T));
+    }
+    
+    // Поиск — возвращает сырые данные
+    std::optional<std::vector<char>> find(const Key& key) const {
+        auto it = index_.find(key);
+        if (it == index_.end()) {
+            return std::nullopt;
+        }
+        
+        return read_data_from_page(it->second);
+    }
+    
+    // Поиск с десериализацией в строку
+    std::optional<std::string> find_string(const Key& key) const {
+        auto data = find(key);
+        if (!data) {
+            return std::nullopt;
+        }
+        return std::string(data->begin(), data->end());
+    }
+    
+    // Поиск с десериализацией в POD тип
+    template<typename T>
+    std::optional<T> find_value(const Key& key) const {
+        static_assert(std::is_trivially_copyable_v<T>, "T must be trivially copyable");
+        
+        auto data = find(key);
+        if (!data || data->size() != sizeof(T)) {
+            return std::nullopt;
+        }
+        
+        T result;
+        memcpy(&result, data->data(), sizeof(T));
+        return result;
+    }
+    
+    // Удаление
+    bool remove(const Key& key) {
+        auto it = index_.find(key);
+        if (it == index_.end()) {
+            return false;
+        }
+        
+        // Освобождаем страницу с данными
+        page_manager_.free_page(it->second);
+        
+        // Удаляем из индекса
+        index_.erase(it);
+        return true;
+    }
+    
+    // Проверка наличия
+    bool contains(const Key& key) const {
+        return index_.find(key) != index_.end();
+    }
+    
+    // Размер индекса
+    size_t size() const {
+        return index_.size();
+    }
+    
+    // Очистка
+    void clear() {
+        // Обходим все записи и освобождаем страницы
+        for (auto it = index_.begin(); it != index_.end(); ++it) {
+            page_manager_.free_page(it->second);
+        }
+        index_.clear();
+    }
+    
+    // Сохранение метаданных индекса
+    void save_metadata(uint64_t& root_page_id, uint64_t& leaf_head_page_id) {
+        // Здесь нужно сохранить узлы B-дерева в страницы
+        // и вернуть ID страниц для корня и головы листьев
+        save_node(index_._root, root_page_id, leaf_head_page_id);
+    }
+    
+    // Загрузка метаданных индекса
+    void load_metadata(uint64_t root_page_id, uint64_t leaf_head_page_id) {
+        index_.clear();
+        if (root_page_id != 0) {
+            index_._root = load_node(root_page_id);
+        }
+        if (leaf_head_page_id != 0) {
+            index_._leaf_head = static_cast<typename decltype(index_)::leaf_node*>(
+                load_node(leaf_head_page_id)
+            );
+        }
+    }
+    
+    // Прямой доступ к B-дереву (для продвинутых операций)
+    auto& tree() { return index_; }
+    const auto& tree() const { return index_; }
+    
+private:
+    // Формат страницы данных:
+    // [8 байт: size_t размер данных][данные...]
+    
+    uint64_t write_data_to_page(const void* data, size_t size) {
+        uint64_t page_id = page_manager_.allocate_page();
+        auto page = page_manager_.load_page(page_id);
+        
+        // Проверяем, что данные помещаются в страницу
+        if (size + sizeof(size_t) > PageConfig::DATA_SIZE) {
+            throw std::runtime_error("Data too large for single page");
+        }
+        
+        // Пишем размер
+        *reinterpret_cast<size_t*>(page->data) = size;
+        
+        // Пишем данные
+        if (size > 0) {
+            memcpy(page->data + sizeof(size_t), data, size);
+        }
+        
+        page_manager_.mark_dirty(page_id);
+        return page_id;
+    }
+    
+    std::vector<char> read_data_from_page(uint64_t page_id) const {
+        auto page = page_manager_.load_page(page_id);
+        
+        size_t size = *reinterpret_cast<size_t*>(page->data);
+        std::vector<char> result(size);
+        
+        if (size > 0) {
+            memcpy(result.data(), page->data + sizeof(size_t), size);
+        }
+        
+        return result;
+    }
+    
+    // Сериализация узла B-дерева в страницу
+    void save_node(typename decltype(index_)::node* node, 
+                   uint64_t& page_id_out,
+                   uint64_t& leaf_head_id_out) {
+        if (!node) {
+            page_id_out = 0;
+            return;
+        }
+        
+        uint64_t page_id = page_manager_.allocate_page();
+        auto page = page_manager_.load_page(page_id);
+        
+        size_t offset = 0;
+        
+        // Флаг листа
+        bool is_leaf = node->leaf;
+        memcpy(page->data + offset, &is_leaf, sizeof(bool));
+        offset += sizeof(bool);
+        
+        // Количество ключей
+        memcpy(page->data + offset, &node->key_count, sizeof(size_t));
+        offset += sizeof(size_t);
+        
+        // Ключи
+        size_t keys_size = node->key_count * sizeof(Key);
+        memcpy(page->data + offset, node->keys, keys_size);
+        offset += keys_size;
+        
+        if (is_leaf) {
+            auto* leaf = static_cast<typename decltype(index_)::leaf_node*>(node);
+            
+            // Значения (page_id для каждого ключа)
+            for (size_t i = 0; i < node->key_count; ++i) {
+                uint64_t value_page_id = leaf->values[i].second;
+                memcpy(page->data + offset, &value_page_id, sizeof(uint64_t));
+                offset += sizeof(uint64_t);
+            }
+            
+            // Указатель на следующий лист
+            uint64_t next_id = 0;
+            if (leaf->next) {
+                // Сохраняем следующий лист рекурсивно
+                save_node(leaf->next, next_id, leaf_head_id_out);
+            }
+            memcpy(page->data + offset, &next_id, sizeof(uint64_t));
+            
+            // Если это первый лист — запоминаем как голову
+            if (!index_._leaf_head || leaf == index_._leaf_head) {
+                leaf_head_id_out = page_id;
+            }
+        } else {
+            // Дочерние узлы
+            for (size_t i = 0; i <= node->key_count; ++i) {
+                uint64_t child_id = 0;
+                save_node(node->children[i], child_id, leaf_head_id_out);
+                memcpy(page->data + offset, &child_id, sizeof(uint64_t));
+                offset += sizeof(uint64_t);
+            }
+        }
+        
+        page_manager_.mark_dirty(page_id);
+        page_id_out = page_id;
+        
+        // Сохраняем маппинг
+        node_page_map_[reinterpret_cast<uintptr_t>(node)] = page_id;
+    }
+    
+    // Десериализация узла из страницы
+    typename decltype(index_)::node* load_node(uint64_t page_id) {
+        if (page_id == 0) return nullptr;
+        
+        auto page = page_manager_.load_page(page_id);
+        size_t offset = 0;
+        
+        bool is_leaf;
+        memcpy(&is_leaf, page->data + offset, sizeof(bool));
+        offset += sizeof(bool);
+        
+        auto* node = index_.create_node(is_leaf);
+        node_page_map_[reinterpret_cast<uintptr_t>(node)] = page_id;
+        
+        size_t key_count;
+        memcpy(&key_count, page->data + offset, sizeof(size_t));
+        offset += sizeof(size_t);
+        node->key_count = key_count;
+        
+        // Ключи
+        size_t keys_size = key_count * sizeof(Key);
+        memcpy(node->keys, page->data + offset, keys_size);
+        offset += keys_size;
+        
+        if (is_leaf) {
+            auto* leaf = static_cast<typename decltype(index_)::leaf_node*>(node);
+            
+            // Значения
+            for (size_t i = 0; i < key_count; ++i) {
+                uint64_t value_page_id;
+                memcpy(&value_page_id, page->data + offset, sizeof(uint64_t));
+                offset += sizeof(uint64_t);
+                
+                leaf->values[i] = {node->keys[i], value_page_id};
+            }
+            
+            // Следующий лист
+            uint64_t next_id;
+            memcpy(&next_id, page->data + offset, sizeof(uint64_t));
+            leaf->next = static_cast<decltype(leaf->next)>(load_node(next_id));
+            
+            // Устанавливаем голову листьев
+            if (!index_._leaf_head) {
+                index_._leaf_head = leaf;
+            }
+        } else {
+            // Дочерние узлы
+            for (size_t i = 0; i <= key_count; ++i) {
+                uint64_t child_id;
+                memcpy(&child_id, page->data + offset, sizeof(uint64_t));
+                offset += sizeof(uint64_t);
+                
+                node->children[i] = load_node(child_id);
+            }
+        }
+        
+        return node;
+    }
+    
+    PageManager& page_manager_;
+    BP_tree<Key, uint64_t> index_;  // Ключ → page_id с данными
+    
+    // Маппинг указателей узлов на ID страниц (для сериализации)
+    mutable std::unordered_map<uintptr_t, uint64_t> node_page_map_;
+};
+
+
+#endif // PAGE_STORAGE_H
