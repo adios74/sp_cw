@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <cstring>
+#include <limits> 
 #include "Index.h" // btree here
 // We are using pages as a nodes of btree for storaging them at disk
 
@@ -171,7 +172,24 @@ template<typename T>
 class page_aware_allocator {
 public: // idk about that. all this allocator shit is dubious, if something - i will change it
 // i just hope after ill do tests they will work and it will be happy time for us
+
+
     using value_type = T;
+    
+        size_t max_size() const noexcept {
+        return std::numeric_limits<size_t>::max() / sizeof(T);
+    }
+    
+    // Добавьте construct/destroy для C++17 совместимости
+    template<typename U, typename... Args>
+    void construct(U* p, Args&&... args) {
+        ::new((void*)p) U(std::forward<Args>(args)...);
+    }
+    
+    template<typename U>
+    void destroy(U* p) {
+        p->~U();
+    }
     
     page_aware_allocator(PageManager& pm) noexcept : page_manager_(&pm) {}
     
