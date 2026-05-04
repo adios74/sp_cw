@@ -20,6 +20,7 @@ struct PageConfig {
 
 struct PageHeader {
     uint64_t page_id;  // Уникальный идентификатор страницы
+    bool dirty;
     // можно добавить: флаги, контрольную сумму, LSN и т.д.
 };
 
