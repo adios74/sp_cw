@@ -12,19 +12,24 @@
 #include <limits> 
 #include "Index.h" // btree here
 // We are using pages as a nodes of btree for storaging them at disk
-
-
-struct PageConfig {
-    static constexpr size_t PAGE_SIZE = 4096;  // 4KB страницы
-    static constexpr size_t HEADER_SIZE = sizeof(uint64_t);  // ID страницы в заголовке
-    static constexpr size_t DATA_SIZE = PAGE_SIZE - HEADER_SIZE;
-};
-
 struct PageHeader {
     uint64_t page_id;  // Уникальный идентификатор страницы
     bool dirty;
     // можно добавить: флаги, контрольную сумму, LSN и т.д.
 };
+
+
+struct PageConfig {
+    static constexpr size_t PAGE_SIZE = 4096;  // 4KB страницы
+    // todo: оптимизация под узлы маленького размера
+    static constexpr size_t HEADER_SIZE = sizeof(PageHeader);  // ID страницы в заголовке
+    static constexpr size_t DATA_SIZE = PAGE_SIZE - HEADER_SIZE;
+};
+
+#pragma pack(push, 1)
+
+
+#pragma pack(pop)
 
 struct Page {
     PageHeader header;
@@ -48,6 +53,7 @@ public:
                 throw std::runtime_error("Cannot create database file: " + filename);
             }
             write_metadata();
+            file_.flush();
         } else {
             read_metadata();
         }
