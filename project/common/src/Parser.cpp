@@ -179,7 +179,7 @@ UseStmt Parser::parseUse() {
 
 CreateTableStmt Parser::parseCreateTable() {
     CreateTableStmt stmt;
-    stmt.name = consume(TokenType::IDENTIFIER, "Expected table name").text;
+    stmt.table = parseTableRef(); 
     consume(TokenType::LBRACKET, "Expected '(' after table name");
     if (!check(TokenType::RBRACKET)) {
         stmt.columns.push_back(parseColumnDef());
@@ -193,7 +193,7 @@ CreateTableStmt Parser::parseCreateTable() {
 
 DropTableStmt Parser::parseDropTable() {
     DropTableStmt stmt;
-    stmt.name = consume(TokenType::IDENTIFIER, "Expected table name").text;
+    stmt.table = parseTableRef();
     return stmt;
 }
 
@@ -373,8 +373,8 @@ std::unique_ptr<Expr> Parser::parsePrimaryExpr() {
         Value endVal = parseOperand();
         return makeBetween(std::move(leftVal), std::move(startVal), std::move(endVal));
     } else if (match(TokenType::LIKE)) {
-        std::string pattern = consume(TokenType::STRING_LITERAL, "Expected string pattern after LIKE").text;
-        return makeLike(std::move(leftVal), std::move(pattern));
+        Value patternVal = parseOperand();
+        return makeLike(std::move(leftVal), std::move(patternVal));
     } else if (check(TokenType::OP_EQUAL) || check(TokenType::OP_NOT_EQUAL) ||
                check(TokenType::OP_LESS) || check(TokenType::OP_GREATER) ||
                check(TokenType::OP_LESS_OR_EQUAL) || check(TokenType::OP_GREATER_OR_EQUAL)) {

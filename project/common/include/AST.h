@@ -52,7 +52,7 @@ struct BetweenExpr {
 
 struct LikeExpr {
     Value val;
-    std::string pattern;
+    Value pattern;
 };
 
 struct Expr {
@@ -114,12 +114,12 @@ struct UseStmt {
 };
 
 struct CreateTableStmt {
-    std::string name;
+    TableRef table;
     std::vector<ColumnDef> columns;
 };
 
 struct DropTableStmt {
-    std::string name;
+    TableRef table;
 };
 
 struct InsertStmt {
@@ -167,7 +167,7 @@ std::string selectExprToString(const SelectExpr& se);
 // Фабрики для Expr
 std::unique_ptr<Expr> makeComparison(ComparisonOp op, Value left, Value right);
 std::unique_ptr<Expr> makeBetween(Value val, Value start, Value end);
-std::unique_ptr<Expr> makeLike(Value val, std::string pattern);
+std::unique_ptr<Expr> makeLike(Value val, Value pattern);
 std::unique_ptr<Expr> makeAnd(std::unique_ptr<Expr> left, std::unique_ptr<Expr> right);
 std::unique_ptr<Expr> makeOr(std::unique_ptr<Expr> left, std::unique_ptr<Expr> right);
 std::unique_ptr<Expr> makeNot(std::unique_ptr<Expr> expr);

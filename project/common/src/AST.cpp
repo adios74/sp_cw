@@ -74,7 +74,7 @@ std::string exprToString(const Expr* expr) {
                    valueToString(expr->between.start) + " AND " +
                    valueToString(expr->between.end);
         case Expr::LIKE:
-            return valueToString(expr->like.val) + " LIKE \"" + expr->like.pattern + "\"";
+            return valueToString(expr->like.val) + " LIKE " + valueToString(expr->like.pattern);
         case Expr::AND:
             return "(" + exprToString(expr->left.get()) + " AND " +
                    exprToString(expr->right.get()) + ")";
@@ -103,7 +103,9 @@ std::string astToString(const Statement& stmt) {
             oss << "USE " << s.name;
         }
         void operator()(const CreateTableStmt& s) {
-            oss << "CREATE TABLE " << s.name << " (";
+            oss << "CREATE TABLE ";
+            if (!s.table.database.empty()) oss << s.table.database << ".";
+            oss << s.table.name << " (";
             for (size_t i = 0; i < s.columns.size(); ++i) {
                 if (i > 0) oss << ", ";
                 oss << s.columns[i].name << " " << s.columns[i].type;
@@ -119,7 +121,9 @@ std::string astToString(const Statement& stmt) {
             oss << ")";
         }
         void operator()(const DropTableStmt& s) {
-            oss << "DROP TABLE " << s.name;
+            oss << "DROP TABLE ";
+            if (!s.table.database.empty()) oss << s.table.database << ".";
+            oss << s.table.name;
         }
         void operator()(const InsertStmt& s) {
             oss << "INSERT INTO ";
@@ -207,7 +211,7 @@ std::unique_ptr<Expr> makeBetween(Value val, Value start, Value end) {
     return e;
 }
 
-std::unique_ptr<Expr> makeLike(Value val, std::string pattern) {
+std::unique_ptr<Expr> makeLike(Value val, Value pattern) {
     auto e = std::make_unique<Expr>();
     e->type = Expr::LIKE;
     e->like.val = std::move(val);
