@@ -1,8 +1,7 @@
 #include "../include/Json.h"
-#include "../include/json.hpp"
+#include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <algorithm>
-
 
 nlohmann::json valueToJson(const Value& val) {
     
@@ -43,7 +42,12 @@ std::string formatSelectResult(const SelectStmt& stmt,
     if (stmt.columns.empty()) {
 
         for (size_t i = 0; i < schema.columnNames.size(); ++i) {
-            outputCols.push_back({static_cast<int>(i), schema.columnNames[i]});
+            OutputColumn col;
+            col.index = static_cast<int>(i);
+            col.jsonKey = schema.columnNames[i];
+            col.isAggregate = false;
+            col.aggArgIndex = -1;
+            outputCols.push_back(col);
         }
 
     } else {
@@ -70,18 +74,10 @@ std::string formatSelectResult(const SelectStmt& stmt,
                     out.jsonKey = selCol.alias.value_or(
                         [&]() -> std::string {
                             switch (expr.func) {
-                                case AggFunc::SUM: {
-                                    return "SUM";
-                                }
-                                case AggFunc::COUNT: {
-                                    return "COUNT";
-                                }
-                                case AggFunc::AVG: {
-                                    return "AVG";
-                                }
-                                default: {
-                                    return "UNKNOWN";
-                                }
+                                case AggFunc::SUM: return "SUM";
+                                case AggFunc::COUNT: return "COUNT";
+                                case AggFunc::AVG: return "AVG";
+                                default: return "UNKNOWN";
                             }
                         }()
                     );

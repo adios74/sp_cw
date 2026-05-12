@@ -4,6 +4,7 @@
 #include "../common/include/AST.h"
 #include "../common/include/Lexer.h"
 #include "../common/include/Parser.h"
+#include "../common/include/Json.h"
 
 int main(int argc, char* argv[]) {
     std::ifstream file;           // владеет файлом, если открыт
@@ -45,6 +46,31 @@ int main(int argc, char* argv[]) {
             std::cerr << "Error: " << ex.what() << std::endl;
         }
     }
+    
+    // Тестовый код для JSON форматера
+    TableSchema schema;
+    schema.columnNames = {"id", "name", "age"};
+
+    SelectStmt stmt;
+    stmt.table.name = "students";
+    // SELECT name, age FROM students WHERE ... (условие не важно)
+    SelectColumn col1;
+    col1.expr = ColumnRef{"name", "", ""};  // Исправлено: добавлены недостающие поля
+    stmt.columns.push_back(col1);
+
+    SelectColumn col2;
+    col2.expr = ColumnRef{"age", "", ""};   // Исправлено: добавлены недостающие поля
+    stmt.columns.push_back(col2);
+
+    // Фиктивные строки - ИСПРАВЛЕНО: убран nullptr
+    std::vector<Row> testRows = {
+        {Value(1), Value(std::string("Alice")), Value(20)},
+        {Value(2), Value(std::string("Bob")), Value(22)},
+        {Value(3), Value(std::string("Unknown")), Value(19)}  // Вместо nullptr используем строку "Unknown"
+    };
+
+    std::string jsonResult = formatSelectResult(stmt, testRows, schema);
+    std::cout << "JSON: " << jsonResult << std::endl;
 
     return 0;
 }

@@ -14,37 +14,60 @@ else()
 endif()
 
 # ============================================================
-# Автоматическая загрузка nlohmann/json
+# Поиск установленной nlohmann/json
 # ============================================================
-include(FetchContent)
+find_package(nlohmann_json REQUIRED)
 
-FetchContent_Declare(
-    json
-    GIT_REPOSITORY https://github.com/nlohmann/json.git
-    GIT_TAG v3.11.3
+# ============================================================
+# Добавляем все include директории
+# ============================================================
+set(INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/project/storage_node/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/project/common/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/project/client
+    ${CMAKE_CURRENT_SOURCE_DIR}/project/client/Text\ handler/include
 )
-FetchContent_MakeAvailable(json)
 
 # ============================================================
-# Добавляем include директории
-# ============================================================
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/project/storage_node/include)
-
-# ============================================================
-# Библиотека storage_node
+# Собираем все исходники
 # ============================================================
 file(GLOB_RECURSE STORAGE_SOURCES 
     "project/storage_node/src/*.cpp"
 )
 
-if(STORAGE_SOURCES)
-    add_library(storage_node ${STORAGE_SOURCES})
-    target_include_directories(storage_node PUBLIC 
-        ${CMAKE_CURRENT_SOURCE_DIR}/project/storage_node/include
-    )
-    # Подключаем JSON-библиотеку к storage_node
+file(GLOB_RECURSE COMMON_SOURCES 
+    "project/common/src/*.cpp"
+)
+
+file(GLOB_RECURSE TEXT_HANDLER_SOURCES 
+    "project/client/Text\ handler/src/*.cpp"
+)
+
+set(LIBRARY_SOURCES
+    ${STORAGE_SOURCES}
+    ${COMMON_SOURCES}
+    ${TEXT_HANDLER_SOURCES}
+)
+
+list(REMOVE_ITEM LIBRARY_SOURCES 
+    "${CMAKE_CURRENT_SOURCE_DIR}/project/client/main.cpp"
+)
+
+if(LIBRARY_SOURCES)
+    add_library(storage_node ${LIBRARY_SOURCES})
+    target_include_directories(storage_node PUBLIC ${INCLUDE_DIRS})
     target_link_libraries(storage_node PUBLIC nlohmann_json::nlohmann_json)
 endif()
+
+# ============================================================
+# Создаем исполняемый файл из main.cpp
+# ============================================================
+add_executable(storage_client 
+    "project/client/main.cpp"
+)
+
+target_link_libraries(storage_client PRIVATE storage_node nlohmann_json::nlohmann_json)
+target_include_directories(storage_client PRIVATE ${INCLUDE_DIRS})
 
 # ============================================================
 # Тесты
@@ -55,9 +78,6 @@ if(BUILD_TESTS)
     add_subdirectory(project/storage_node/tests)
 endif()
 
-# ============================================================
-# Дополнительные цели
-# ============================================================
 add_custom_target(format
     COMMAND find ${CMAKE_CURRENT_SOURCE_DIR}/project -name "*.cpp" -o -name "*.h" | xargs clang-format -i
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
