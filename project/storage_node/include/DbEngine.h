@@ -379,3 +379,235 @@ private:
                        std::shared_ptr<Table>> tables_;
 };
 
+class DBMS {
+public:
+    explicit DBMS(const std::string& root_dir)
+        : root_dir_(root_dir) {
+
+        if (!fs::exists(root_dir_)) {
+            fs::create_directories(root_dir_);
+        }
+    }
+
+    bool createDatabase(const std::string& name) {
+        if (databases_.contains(name)) {
+            return false;
+        }
+
+        databases_[name] =
+            std::make_shared<Database>(root_dir_, name);
+
+        return true;
+    }
+
+    bool dropDatabase(const std::string& name) {
+        auto it = databases_.find(name);
+
+        if (it == databases_.end()) {
+            return false;
+        }
+
+        databases_.erase(it);
+
+        std::string path = root_dir_ + "/" + name;
+
+        if (fs::exists(path)) {
+            fs::remove_all(path);
+        }
+
+        return true;
+    }
+
+    bool useDatabase(const std::string& name) {
+        auto it = databases_.find(name);
+
+        if (it == databases_.end()) {
+            return false;
+        }
+
+        current_db_ = it->second;
+        return true;
+    }
+
+    std::shared_ptr<Database> currentDatabase() {
+        return current_db_;
+    }
+
+private:
+    std::string root_dir_;
+
+    std::unordered_map<std::string,
+                       std::shared_ptr<Database>> databases_;
+
+    std::shared_ptr<Database> current_db_;
+};
+
+
+
+class SQLExecutor {
+public:
+    explicit SQLExecutor(DBMS& dbms)
+        : dbms_(dbms) {}
+
+    void execute(const Statement& stmt) {
+        std::visit([this](auto&& arg) {
+            executeStatement(arg);
+        }, stmt);
+    }
+
+private:
+    DBMS& dbms_;
+
+private:
+    void executeStatement(const CreateDatabaseStmt& stmt) {
+        bool ok = dbms_.createDatabase(stmt.name);
+
+        std::cout << (ok
+            ? "Database created\n"
+            : "Failed to create database\n");
+    }
+
+    void executeStatement(const DropDatabaseStmt& stmt) {
+        bool ok = dbms_.dropDatabase(stmt.name);
+
+        std::cout << (ok
+            ? "Database dropped\n"
+            : "Failed to drop database\n");
+    }
+
+    void executeStatement(const UseStmt& stmt) {
+        bool ok = dbms_.useDatabase(stmt.name);
+
+        std::cout << (ok
+            ? "Using database\n"
+            : "Database not found\n");
+    }
+
+    void executeStatement(const CreateTableStmt& stmt) {
+        auto db = dbms_.currentDatabase();
+
+        if (!db) {
+            std::cout << "No database selected\n";
+            return;
+        }
+
+        bool ok = db->createTable(stmt);
+
+        std::cout << (ok
+            ? "Table created\n"
+            : "Failed to create table\n");
+    }
+
+    void executeStatement(const DropTableStmt& stmt) {
+        auto db = dbms_.currentDatabase();
+
+        if (!db) {
+            std::cout << "No database selected\n";
+            return;
+        }
+
+        bool ok = db->dropTable(stmt.table.name);
+
+        std::cout << (ok
+            ? "Table dropped\n"
+            : "Failed to drop table\n");
+    }
+
+    void executeStatement(const InsertStmt& stmt) {
+        auto db = dbms_.currentDatabase();
+
+        if (!db) {
+            std::cout << "No database selected\n";
+            return;
+        }
+
+        auto table = db->getTable(stmt.table.name);
+
+        if (!table) {
+            std::cout << "Table not found\n";
+            return;
+        }
+
+        for (const auto& row : stmt.values) {
+            table->insertRow(row);
+        }
+
+        std::cout << "Inserted "
+                  << stmt.values.size()
+                  << " rows\n";
+    }
+
+    void executeStatement(const SelectStmt& stmt) {
+        auto db = dbms_.currentDatabase();
+
+        if (!db) {
+            std::cout << "No database selected\n";
+            return;
+        }
+
+        auto table = db->getTable(stmt.table.name);
+
+        if (!table) {
+            std::cout << "Table not found\n";
+            return;
+        }
+
+        auto rows = table->selectRows(stmt.condition.get());
+
+        TableSchema schema;
+
+        for (const auto& col : table->metadata().columns) {
+            schema.columnNames.push_back(col.name);
+        }
+
+        std::cout << formatSelectResult(stmt,
+                                        rows,
+                                        schema)
+                  << std::endl;
+    }
+
+    void executeStatement(const UpdateStmt& stmt) {
+        auto db = dbms_.currentDatabase();
+
+        if (!db) {
+            std::cout << "No database selected\n";
+            return;
+        }
+
+        auto table = db->getTable(stmt.table.name);
+
+        if (!table) {
+            std::cout << "Table not found\n";
+            return;
+        }
+
+        size_t updated = table->updateRows(stmt.assignments,
+                                           stmt.condition.get());
+
+        std::cout << "Updated "
+                  << updated
+                  << " rows\n";
+    }
+
+    void executeStatement(const DeleteStmt& stmt) {
+        auto db = dbms_.currentDatabase();
+
+        if (!db) {
+            std::cout << "No database selected\n";
+            return;
+        }
+
+        auto table = db->getTable(stmt.table.name);
+
+        if (!table) {
+            std::cout << "Table not found\n";
+            return;
+        }
+
+        size_t deleted = table->deleteRows(stmt.condition.get());
+
+        std::cout << "Deleted "
+                  << deleted
+                  << " rows\n";
+    }
+};
