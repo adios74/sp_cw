@@ -64,6 +64,10 @@ public:
         file_.close();
     }
     
+    const std::string& getFilePath() const {
+        return filename_;
+    }
+    
     void mark_dirty(uint64_t page_id) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = cache_.find(page_id);
