@@ -72,7 +72,7 @@ target_include_directories(storage_client PRIVATE ${INCLUDE_DIRS})
 # ============================================================
 # Тесты
 # ============================================================
-option(BUILD_TESTS "Build tests" OFF) // ochevidno, that you should change that for your brand new tests if youll do them
+option(BUILD_TESTS "Build tests" OFF)
 if(BUILD_TESTS)
     enable_testing()
     add_subdirectory(project/storage_node/tests)
