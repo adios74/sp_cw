@@ -308,4 +308,74 @@ public:
 
         return false;
     }
+}
+class Database {
+public:
+    Database(const std::string& root_path,
+             const std::string& name)
+        : root_path_(root_path),
+          name_(name) {
+
+        db_path_ = root_path_ + "/" + name_;
+
+        if (!fs::exists(db_path_)) {
+            fs::create_directories(db_path_);
+        }
+    }
+
+    const std::string& name() const {
+        return name_;
+    }
+
+    bool createTable(const CreateTableStmt& stmt) {
+        if (tables_.contains(stmt.table.name)) {
+            return false;
+        }
+
+        TableMetadata meta;
+        meta.name = stmt.table.name;
+        meta.columns = stmt.columns;
+
+        auto table = std::make_shared<Table>(db_path_, meta);
+        tables_[meta.name] = table;
+
+        return true;
+    }
+
+    bool dropTable(const std::string& table_name) {
+        auto it = tables_.find(table_name);
+
+        if (it == tables_.end()) {
+            return false;
+        }
+
+        tables_.erase(it);
+
+        std::string file = db_path_ + "/" + table_name + ".tbl";
+
+        if (fs::exists(file)) {
+            fs::remove(file);
+        }
+
+        return true;
+    }
+
+    std::shared_ptr<Table> getTable(const std::string& name) {
+        auto it = tables_.find(name);
+
+        if (it == tables_.end()) {
+            return nullptr;
+        }
+
+        return it->second;
+    }
+
+private:
+    std::string root_path_;
+    std::string name_;
+    std::string db_path_;
+
+    std::unordered_map<std::string,
+                       std::shared_ptr<Table>> tables_;
 };
+
