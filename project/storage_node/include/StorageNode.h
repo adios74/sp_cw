@@ -300,13 +300,12 @@ public:
     void insert(const Key& key, const void* data, size_t size) {
         auto it = index_.find(key);
         
-        if (it != index_.end()) {
-            // Ключ существует — обновляем данные
-            uint64_t old_page_id = it->second;
-            page_manager_.free_page(old_page_id);
-            
-            uint64_t new_page_id = write_data_to_page(data, size);
-            const_cast<uint64_t&>(it->second) = new_page_id;
+    if (it != index_.end()) {
+        uint64_t old_page_id = it->second;
+        page_manager_.free_page(old_page_id);
+        uint64_t new_page_id = write_data_to_page(data, size);
+        index_.erase(it);                   // удаляем старый ключ
+        index_.insert({key, new_page_id}); // вставляем новый
         } else {
             // Новый ключ
             uint64_t page_id = write_data_to_page(data, size);
