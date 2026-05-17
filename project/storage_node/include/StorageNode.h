@@ -286,9 +286,9 @@ template<typename Key>
 class PageBasedIndex {
 private:
     // Вспомогательные структуры для хранения типов
-    using TreeType = BP_tree<Key, uint64_t, std::less<Key>>;
-    using NodeType = typename TreeType::node;
-    using LeafNodeType = typename TreeType::leaf_node;
+    using TreeType = BSP_tree<Key, uint64_t, std::less<Key>>;
+    using NodeType = typename TreeType::InternalNode;
+    using LeafNodeType = typename TreeType::LeafNode;
     
 public:
     explicit PageBasedIndex(PageManager& pm) 
@@ -407,7 +407,7 @@ public:
             index_._root = load_node(root_page_id);
         }
         if (leaf_head_page_id != 0) {
-            index_._leaf_head = static_cast<typename decltype(index_)::leaf_node*>(
+            index_._leaf_head = static_cast<typename decltype(index_)::LeafNode*>(
                 load_node(leaf_head_page_id)
             );
         }
@@ -456,8 +456,8 @@ private:
     }
     
     // Сериализация узла B-дерева в страницу
-    void save_node(NodeType* node, uint64_t& page_id_out, uint64_t& leaf_head_id_out) {
-        if (!node) {
+    void save_node(NodeType* InternalNode, uint64_t& page_id_out, uint64_t& leaf_head_id_out) {
+        if (!InternalNode) {
             page_id_out = 0;
             return;
         }
@@ -468,24 +468,24 @@ private:
         size_t offset = 0;
         
         // Флаг листа
-        bool is_leaf = node->leaf;
+        bool is_leaf = InternalNode->leaf;
         memcpy(page->data + offset, &is_leaf, sizeof(bool));
         offset += sizeof(bool);
         
         // Количество ключей
-        memcpy(page->data + offset, &node->key_count, sizeof(size_t));
+        memcpy(page->data + offset, &InternalNode->key_count, sizeof(size_t));
         offset += sizeof(size_t);
         
         // Ключи
-        size_t keys_size = node->key_count * sizeof(Key);
-        memcpy(page->data + offset, node->keys, keys_size);
+        size_t keys_size = InternalNode->key_count * sizeof(Key);
+        memcpy(page->data + offset, InternalNode->keys, keys_size);
         offset += keys_size;
         
         if (is_leaf) {
-            auto* leaf = static_cast<LeafNodeType*>(node);
+            auto* leaf = static_cast<LeafNodeType*>(InternalNode);
             
             // Значения (page_id для каждого ключа)
-            for (size_t i = 0; i < node->key_count; ++i) {
+            for (size_t i = 0; i < InternalNode->key_count; ++i) {
                 uint64_t value_page_id = leaf->values[i].second;
                 memcpy(page->data + offset, &value_page_id, sizeof(uint64_t));
                 offset += sizeof(uint64_t);
@@ -503,9 +503,9 @@ private:
             }
         } else {
             // Дочерние узлы
-            for (size_t i = 0; i <= node->key_count; ++i) {
+            for (size_t i = 0; i <= InternalNode->key_count; ++i) {
                 uint64_t child_id = 0;
-                save_node(node->children[i], child_id, leaf_head_id_out);
+                save_node(InternalNode->children[i], child_id, leaf_head_id_out);
                 memcpy(page->data + offset, &child_id, sizeof(uint64_t));
                 offset += sizeof(uint64_t);
             }
@@ -513,7 +513,7 @@ private:
         
         page_manager_.mark_dirty(page_id);
         page_id_out = page_id;
-        node_page_map_[reinterpret_cast<uintptr_t>(node)] = page_id;
+        node_page_map_[reinterpret_cast<uintptr_t>(InternalNode)] = page_id;
     }
     
     // Десериализация узла из страницы
@@ -527,26 +527,26 @@ private:
         memcpy(&is_leaf, page->data + offset, sizeof(bool));
         offset += sizeof(bool);
         
-        auto* node = index_.create_node(is_leaf);
-        node_page_map_[reinterpret_cast<uintptr_t>(node)] = page_id;
+        auto* InternalNode = index_.create_node(is_leaf);
+        node_page_map_[reinterpret_cast<uintptr_t>(InternalNode)] = page_id;
         
         size_t key_count;
         memcpy(&key_count, page->data + offset, sizeof(size_t));
         offset += sizeof(size_t);
-        node->key_count = key_count;
+        InternalNode->key_count = key_count;
         
         size_t keys_size = key_count * sizeof(Key);
-        memcpy(node->keys, page->data + offset, keys_size);
+        memcpy(InternalNode->keys, page->data + offset, keys_size);
         offset += keys_size;
         
         if (is_leaf) {
-            auto* leaf = static_cast<LeafNodeType*>(node);
+            auto* leaf = static_cast<LeafNodeType*>(InternalNode);
             
             for (size_t i = 0; i < key_count; ++i) {
                 uint64_t value_page_id;
                 memcpy(&value_page_id, page->data + offset, sizeof(uint64_t));
                 offset += sizeof(uint64_t);
-                leaf->values[i] = {node->keys[i], value_page_id};
+                leaf->values[i] = {InternalNode->keys[i], value_page_id};
             }
             
             uint64_t next_id;
@@ -561,11 +561,11 @@ private:
                 uint64_t child_id;
                 memcpy(&child_id, page->data + offset, sizeof(uint64_t));
                 offset += sizeof(uint64_t);
-                node->children[i] = load_node(child_id);
+                InternalNode->children[i] = load_node(child_id);
             }
         }
         
-        return node;
+        return InternalNode;
     }
     
     PageManager& page_manager_;

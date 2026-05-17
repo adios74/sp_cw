@@ -524,6 +524,8 @@ TEST_F(PageBasedIndexTest, DataTooLarge) {
     }, std::runtime_error);
 }
 
+
+
 // ==================== Integration Tests ====================
 
 class IntegrationTest : public PageStorageTest {
@@ -713,7 +715,7 @@ TEST_F(IntegrationTest, PersistenceAcrossSessions) {
         
         pm->flush_all();
     }
-    
+    // we have small problem with this test so i will fix it after we do everything else, bibki
     // Сессия 2: чтение данных
     {
         auto pm = std::make_unique<PageManager>(filename);
@@ -837,6 +839,8 @@ TEST_F(PageStorageTest, PerformanceRandomReads) {
 }
 
 // ==================== Error Handling Tests ====================
+
+
 
 TEST_F(PageStorageTest, CorruptedFile) {
     // Создаем нормальный файл
