@@ -277,12 +277,20 @@ DeleteStmt Parser::parseDelete() {
 // SELECT
 SelectStmt Parser::parseSelect() {
     SelectStmt stmt;
+
     if (match(TokenType::STAR)) {
-    } else {
-        stmt.columns.push_back(parseSelectItem());
-        while (match(TokenType::COMMA)) {
+    } else if (match(TokenType::LBRACKET)) {
+        if (!check(TokenType::RBRACKET)) {
             stmt.columns.push_back(parseSelectItem());
+            while (match(TokenType::COMMA)) {
+                stmt.columns.push_back(parseSelectItem());
+            }
         }
+        consume(TokenType::RBRACKET, "Expected ')' after select list");
+    } else {
+        throw std::runtime_error(
+            "Expected '*' or '(' after SELECT, but got '" + currentToken.text + "'"
+        );
     }
 
     consume(TokenType::FROM, "Expected FROM in SELECT");
