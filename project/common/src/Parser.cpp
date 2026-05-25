@@ -1,6 +1,7 @@
 #include "../include/Parser.h"
 #include <stdexcept>
 #include <sstream>
+#include "../include/Utils.h"
 
 Parser::Parser(Lexer& lexer) : lexer(lexer) {
     advance();
@@ -404,23 +405,28 @@ std::unique_ptr<Expr> Parser::parsePrimaryExpr() {
     throw std::runtime_error("Invalid expression after operand");
 }
 
-// Главный метод
+RevertStmt Parser::parseRevert() {
+    RevertStmt stmt;
+    stmt.table = parseTableRef();
+    std::string time_str = consume(TokenType::STRING_LITERAL,
+        "Expected timestamp string in format yyyy.mm.dd-hh:mm:ss.msmsms").text;
+    stmt.timestamp = parseTimestamp(time_str);
+    return stmt;
+}
+
 Statement Parser::parseStatement() {
     if (check(TokenType::END_OF_FILE)) {
         throw std::runtime_error("Empty statement");
     }
-
-    Statement stmt;
+    if (match(TokenType::REVERT)) {
+        return parseRevert();
+    }
     if (check(TokenType::CREATE) || check(TokenType::DROP) || check(TokenType::USE)) {
-        stmt = parseDDL();
-    } else if (check(TokenType::INSERT) || check(TokenType::UPDATE) ||
-               check(TokenType::DELETE) || check(TokenType::SELECT)) {
-        stmt = parseDML();
-    } else {
-        throw std::runtime_error("Unexpected token: " + currentToken.text);
+        return parseDDL();
     }
-    if (!check(TokenType::END_OF_FILE)) {
-        throw std::runtime_error("Unexpected tokens after end of statement");
+    if (check(TokenType::INSERT) || check(TokenType::UPDATE) ||
+        check(TokenType::DELETE) || check(TokenType::SELECT)) {
+        return parseDML();
     }
-    return stmt;
+    throw std::runtime_error("Unexpected token: " + currentToken.text);
 }

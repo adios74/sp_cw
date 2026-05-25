@@ -6,6 +6,7 @@
 #include <memory>
 #include <variant>
 #include <optional>
+#include <chrono>
 
 // Имена таблиц (с опциональной базой данных)
 struct TableRef {
@@ -88,7 +89,6 @@ struct AggCall {
     Value arg;
 };
 
-// То, что может стоять после SELECT: звёздочка, колонка, агрегат
 using SelectExpr = std::variant<
     std::monostate,
     ColumnRef,
@@ -145,6 +145,11 @@ struct SelectStmt {
     std::unique_ptr<Expr> condition;
 };
 
+struct RevertStmt {
+    TableRef table;
+    std::chrono::system_clock::time_point timestamp;
+};
+
 // Корневой узел AST
 using Statement = std::variant<
     CreateDatabaseStmt,
@@ -155,10 +160,11 @@ using Statement = std::variant<
     InsertStmt,
     UpdateStmt,
     DeleteStmt,
-    SelectStmt
+    SelectStmt,
+    RevertStmt
 >;
 
-// Вспомогательные функции (отладка и фабрики)
+// Вспомогательные функции
 std::string astToString(const Statement& stmt);
 std::string valueToString(const Value& v);
 std::string exprToString(const Expr* expr);
@@ -172,4 +178,4 @@ std::unique_ptr<Expr> makeAnd(std::unique_ptr<Expr> left, std::unique_ptr<Expr> 
 std::unique_ptr<Expr> makeOr(std::unique_ptr<Expr> left, std::unique_ptr<Expr> right);
 std::unique_ptr<Expr> makeNot(std::unique_ptr<Expr> expr);
 
-#endif
+#endif // AST_H

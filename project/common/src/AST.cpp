@@ -1,6 +1,7 @@
 #include "../include/AST.h"
 #include <sstream>
-
+#include <iomanip>
+#include <ctime>
 
 std::string valueToString(const Value& v) {
     struct Visitor {
@@ -99,6 +100,19 @@ std::string astToString(const Statement& stmt) {
         void operator()(const DropDatabaseStmt& s) {
             oss << "DROP DATABASE " << s.name;
         }
+
+        void operator()(const RevertStmt& s) {
+            oss << "REVERT ";
+            if (!s.table.database.empty()) oss << s.table.database << ".";
+            oss << s.table.name << " ";
+            // timestamp в строку (формат: yyyy.mm.dd-hh:mm:ss.ms)
+            auto tt = std::chrono::system_clock::to_time_t(s.timestamp);
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          s.timestamp.time_since_epoch()) % 1000;
+            oss << std::put_time(std::localtime(&tt), "%Y.%m.%d-%H:%M:%S");
+            oss << '.' << std::setfill('0') << std::setw(3) << ms.count();
+        }
+
         void operator()(const UseStmt& s) {
             oss << "USE " << s.name;
         }

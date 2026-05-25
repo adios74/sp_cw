@@ -39,6 +39,7 @@ private:
     UpdateStmt parseUpdate();
     DeleteStmt parseDelete();
     SelectStmt parseSelect();
+    RevertStmt parseRevert();
 
     SelectColumn parseSelectItem(); 
 
