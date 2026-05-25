@@ -48,27 +48,45 @@ public:
         return metadata_; 
     }
 
-    bool insertRow(const Row& input_row) {
-        auto row_opt = normalizeRow(input_row);
-        if (!row_opt.has_value()) {
-            return false;
-        }
+enum class InsertError {
+    OK,
+    DUPLICATE_KEY,
+    NOT_NULL_VIOLATION,
+    TYPE_MISMATCH,
+    UNKNOWN
+};
 
-        const Row& row = *row_opt;
-        if (!validateRowTypesAndConstraints(row)) {
-            return false;
-        }
-
-        if (!checkUniqueConstraints(row, std::nullopt)) {
-            return false;
-        }
-
-        uint64_t row_id = metadata_.row_count++;
-        storage_.insert_string(row_id, serializeRow(row));
-        insertIntoUniqueIndexes(row, row_id);
-        saveMetadata();
-        return true;
+std::pair<bool, InsertError> insertRow(const Row& input_row) {
+    auto row_opt = normalizeRow(input_row);
+    if (!row_opt.has_value()) {
+        return {false, InsertError::UNKNOWN};
     }
+
+    const Row& row = *row_opt;
+    if (!validateRowTypesAndConstraints(row)) {
+        // Определяем конкретную причину
+        for (size_t i = 0; i < row.size(); ++i) {
+            if (metadata_.columns[i].constraint == ColumnConstraint::NOT_NULL &&
+                std::holds_alternative<std::nullptr_t>(row[i])) {
+                return {false, InsertError::NOT_NULL_VIOLATION};
+            }
+            if (!isValueCompatibleWithColumn(row[i], metadata_.columns[i])) {
+                return {false, InsertError::TYPE_MISMATCH};
+            }
+        }
+        return {false, InsertError::UNKNOWN};
+    }
+
+    if (!checkUniqueConstraints(row, std::nullopt)) {
+        return {false, InsertError::DUPLICATE_KEY};
+    }
+
+    uint64_t row_id = metadata_.row_count++;
+    storage_.insert_string(row_id, serializeRow(row));
+    insertIntoUniqueIndexes(row, row_id);
+    saveMetadata();
+    return {true, InsertError::OK};
+}
 
     std::vector<Row> selectRows(const Expr* condition = nullptr) {
         std::vector<Row> result;
@@ -895,21 +913,42 @@ private:
 void executeStatement(const InsertStmt& stmt) {
     auto db = dbms_.currentDatabase();
     if (!db) {
-        std::cout << "No database selected\n";
+        std::cout << "Error: No database selected\n";
         return;
     }
 
     auto table = db->getTable(stmt.table.name);
     if (!table) {
-        std::cout << "Table not found\n";
+        std::cout << "Error: Table not found\n";
         return;
     }
 
     size_t inserted = 0;
-    for (const auto& row : stmt.values) {
-        if (table->insertRow(row)) {
-            ++inserted;
+    for (size_t i = 0; i < stmt.values.size(); ++i) {
+        auto [ok, error] = table->insertRow(stmt.values[i]);
+        
+        if (!ok) {
+            // Выводим понятную ошибку и ПРЕРЫВАЕМ операцию
+            switch (error) {
+                case Table::InsertError::DUPLICATE_KEY:
+                    std::cout << "Error: Duplicate key value at row " 
+                              << (i + 1) << "\n";
+                    break;
+                case Table::InsertError::NOT_NULL_VIOLATION:
+                    std::cout << "Error: NOT NULL constraint failed at row " 
+                              << (i + 1) << "\n";
+                    break;
+                case Table::InsertError::TYPE_MISMATCH:
+                    std::cout << "Error: Type mismatch at row " 
+                              << (i + 1) << "\n";
+                    break;
+                default:
+                    std::cout << "Error: Insert failed at row " 
+                              << (i + 1) << "\n";
+            }
+            return;  // Полностью отменяем операцию
         }
+        ++inserted;
     }
 
     std::cout << "Inserted " << inserted << " rows\n";
