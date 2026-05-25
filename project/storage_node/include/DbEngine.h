@@ -700,8 +700,16 @@ public:
         
         if (!fs::exists(db_path_)) {
             fs::create_directories(db_path_);
+            metadata_.created_at = getCurrentTimestamp();
+            metadata_.updated_at = metadata_.created_at;
+            saveDatabaseMetadata();
         } else {
-            loadTables();
+            if (!loadDatabaseMetadata()) {
+                metadata_.created_at = getCurrentTimestamp();
+                metadata_.updated_at = metadata_.created_at;
+                saveDatabaseMetadata();
+                loadTables();
+            }
         }
     }
     
@@ -724,6 +732,10 @@ public:
 
         auto table = std::make_shared<Table>(db_path_, meta);
         tables_[meta.name] = table;
+        
+        // Обновляем метаданные базы данных
+        metadata_.updated_at = getCurrentTimestamp();
+        saveDatabaseMetadata();
         return true;
     }
 
@@ -745,6 +757,9 @@ public:
             fs::remove(meta_file);
         }
         
+        // Обновляем метаданные базы данных
+        metadata_.updated_at = getCurrentTimestamp();
+        saveDatabaseMetadata();
         return true;
     }
 
@@ -756,21 +771,193 @@ public:
         return it->second;
     }
     
+    const std::string& getCreatedAt() const {
+        return metadata_.created_at;
+    }
+    
+    const std::string& getUpdatedAt() const {
+        return metadata_.updated_at;
+    }
+
     void flush() {
         for (auto& [name, table] : tables_) {
             table->saveMetadata();
         }
+        metadata_.updated_at = getCurrentTimestamp();
+        saveDatabaseMetadata();
     }
 
 private:
+    struct DatabaseMetadata {
+        std::string version = "1.0";
+        std::string created_at;
+        std::string updated_at;
+    };
+
+    std::string getCurrentTimestamp() {
+        auto now = std::time(nullptr);
+        std::string timestamp = std::ctime(&now);
+        // Убираем символ новой строки в конце
+        if (!timestamp.empty() && timestamp.back() == '\n') {
+            timestamp.pop_back();
+        }
+        return timestamp;
+    }
+
+    bool saveDatabaseMetadata() {
+        std::string meta_path = db_path_ + "/database.meta";
+        std::ofstream meta_file(meta_path, std::ios::binary);
+        if (!meta_file.is_open()) {
+            std::cerr << "Failed to save database metadata: " << meta_path << std::endl;
+            return false;
+        }
+
+        auto writePod = [&](const auto& v) {
+            meta_file.write(reinterpret_cast<const char*>(&v), sizeof(v));
+        };
+
+        auto writeString = [&](const std::string& s) {
+            size_t len = s.size();
+            writePod(len);
+            if (len > 0) {
+                meta_file.write(s.data(), len);
+            }
+        };
+
+        // Сигнатура файла для проверки формата
+        const char signature[4] = {'D', 'B', 'M', 'T'};
+        meta_file.write(signature, 4);
+        
+        // Версия формата
+        uint32_t format_version = 1;
+        writePod(format_version);
+        
+        // Версия базы данных
+        writeString(metadata_.version);
+        
+        // Имя базы данных
+        writeString(name_);
+        
+        // Временные метки
+        writeString(metadata_.created_at);
+        writeString(metadata_.updated_at);
+        
+        // Количество таблиц
+        size_t table_count = tables_.size();
+        writePod(table_count);
+        
+        // Информация о таблицах
+        for (const auto& [table_name, table] : tables_) {
+            writeString(table_name);
+            writePod(table->metadata().row_count);
+            writePod(table->metadata().columns.size());
+            
+            // Сохраняем информацию о колонках для быстрой загрузки
+            for (const auto& col : table->metadata().columns) {
+                writeString(col.name);
+                writeString(col.type);
+                uint8_t constraint = static_cast<uint8_t>(col.constraint);
+                writePod(constraint);
+            }
+        }
+
+        meta_file.close();
+        return true;
+    }
+
+    bool loadDatabaseMetadata() {
+        std::string meta_path = db_path_ + "/database.meta";
+        std::ifstream meta_file(meta_path, std::ios::binary);
+        if (!meta_file.is_open()) {
+            return false;
+        }
+
+        auto readPod = [&](auto& v) {
+            meta_file.read(reinterpret_cast<char*>(&v), sizeof(v));
+        };
+
+        auto readString = [&]() -> std::string {
+            size_t len = 0;
+            readPod(len);
+            std::string s(len, '\0');
+            if (len > 0) {
+                meta_file.read(s.data(), len);
+            }
+            return s;
+        };
+
+        // Проверяем сигнатуру
+        char signature[4];
+        meta_file.read(signature, 4);
+        if (signature[0] != 'D' || signature[1] != 'B' || 
+            signature[2] != 'M' || signature[3] != 'T') {
+            meta_file.close();
+            return false;
+        }
+        
+        // Версия формата
+        uint32_t format_version = 0;
+        readPod(format_version);
+        if (format_version != 1) {
+            meta_file.close();
+            return false;
+        }
+        
+        // Версия базы данных
+        metadata_.version = readString();
+        
+        // Имя базы данных (сверяем с текущим)
+        std::string stored_name = readString();
+        if (stored_name != name_) {
+            std::cerr << "Warning: Database name mismatch in metadata" << std::endl;
+        }
+        
+        // Временные метки
+        metadata_.created_at = readString();
+        metadata_.updated_at = readString();
+        
+        // Количество таблиц (просто считываем, но не используем - таблицы загрузятся отдельно)
+        size_t table_count = 0;
+        readPod(table_count);
+        
+        // Пропускаем детальную информацию о таблицах, 
+        // так как таблицы загрузятся из своих собственных метафайлов
+        for (size_t i = 0; i < table_count; ++i) {
+            readString(); // table_name
+            uint64_t dummy_row_count = 0;
+            readPod(dummy_row_count);
+            size_t dummy_col_count = 0;
+            readPod(dummy_col_count);
+            for (size_t j = 0; j < dummy_col_count; ++j) {
+                readString(); // col_name
+                readString(); // col_type
+                uint8_t dummy_constraint = 0;
+                readPod(dummy_constraint);
+            }
+        }
+
+        meta_file.close();
+        
+        // Загружаем таблицы
+        loadTables();
+        
+        return true;
+    }
+
     void loadTables() {
         for (const auto& entry : fs::directory_iterator(db_path_)) {
             if (entry.path().extension() == ".meta") {
+                // Пропускаем метафайл самой базы данных
+                if (entry.path().filename() == "database.meta") {
+                    continue;
+                }
+                
                 auto metadata_opt = Table::loadMetadata(entry.path().string());
                 if (metadata_opt) {
                     auto table = std::make_shared<Table>(db_path_, *metadata_opt);
                     tables_[metadata_opt->name] = table;
-                    std::cout << "Loaded table: " << metadata_opt->name << std::endl;
+                    std::cout << "Loaded table: " << metadata_opt->name 
+                              << " (" << metadata_opt->row_count << " rows)" << std::endl;
                 }
             }
         }
@@ -780,6 +967,7 @@ private:
     std::string name_;
     std::string db_path_;
     std::unordered_map<std::string, std::shared_ptr<Table>> tables_;
+    DatabaseMetadata metadata_;
 };
 
 // ==================== DBMS Implementation ====================
@@ -790,8 +978,16 @@ public:
         : root_dir_(root_dir) {
         if (!fs::exists(root_dir_)) {
             fs::create_directories(root_dir_);
+            metadata_.created_at = getCurrentTimestamp();
+            metadata_.updated_at = metadata_.created_at;
+            saveDBMSMetadata();
         } else {
-            loadDatabases();
+            if (!loadDBMSMetadata()) {
+                metadata_.created_at = getCurrentTimestamp();
+                metadata_.updated_at = metadata_.created_at;
+                saveDBMSMetadata();
+                loadDatabases();
+            }
         }
     }
     
@@ -804,6 +1000,8 @@ public:
             return false;
         }
         databases_[name] = std::make_shared<Database>(root_dir_, name);
+        metadata_.updated_at = getCurrentTimestamp();
+        saveDBMSMetadata();
         return true;
     }
 
@@ -813,6 +1011,11 @@ public:
             return false;
         }
 
+        // Если удаляем текущую БД, сбрасываем указатель
+        if (current_db_ && current_db_->name() == name) {
+            current_db_.reset();
+        }
+
         databases_.erase(it);
         
         std::string path = root_dir_ + "/" + name;
@@ -820,6 +1023,8 @@ public:
             fs::remove_all(path);
         }
         
+        metadata_.updated_at = getCurrentTimestamp();
+        saveDBMSMetadata();
         return true;
     }
 
@@ -829,6 +1034,16 @@ public:
             return false;
         }
         current_db_ = it->second;
+        
+        // Сохраняем текущую БД в метаданных
+        if (current_db_) {
+            metadata_.current_database = current_db_->name();
+        } else {
+            metadata_.current_database.clear();
+        }
+        metadata_.updated_at = getCurrentTimestamp();
+        saveDBMSMetadata();
+        
         return true;
     }
 
@@ -836,13 +1051,179 @@ public:
         return current_db_;
     }
     
+    const std::string& getRootDir() const {
+        return root_dir_;
+    }
+
+    std::vector<std::string> getDatabaseList() const {
+        std::vector<std::string> db_list;
+        for (const auto& [name, _] : databases_) {
+            db_list.push_back(name);
+        }
+        return db_list;
+    }
+
     void flushAll() {
         for (auto& [name, db] : databases_) {
             db->flush();
         }
+        metadata_.updated_at = getCurrentTimestamp();
+        saveDBMSMetadata();
     }
 
 private:
+    struct DBMSMetadata {
+        std::string version = "1.0";
+        std::string created_at;
+        std::string updated_at;
+        std::string current_database;
+    };
+
+    std::string getCurrentTimestamp() {
+        auto now = std::time(nullptr);
+        std::string timestamp = std::ctime(&now);
+        if (!timestamp.empty() && timestamp.back() == '\n') {
+            timestamp.pop_back();
+        }
+        return timestamp;
+    }
+
+    bool saveDBMSMetadata() {
+        std::string meta_path = root_dir_ + "/dbms.meta";
+        std::ofstream meta_file(meta_path, std::ios::binary);
+        if (!meta_file.is_open()) {
+            std::cerr << "Failed to save DBMS metadata: " << meta_path << std::endl;
+            return false;
+        }
+
+        auto writePod = [&](const auto& v) {
+            meta_file.write(reinterpret_cast<const char*>(&v), sizeof(v));
+        };
+
+        auto writeString = [&](const std::string& s) {
+            size_t len = s.size();
+            writePod(len);
+            if (len > 0) {
+                meta_file.write(s.data(), len);
+            }
+        };
+
+        // Сигнатура файла для проверки формата
+        const char signature[4] = {'D', 'B', 'M', 'S'};
+        meta_file.write(signature, 4);
+        
+        // Версия формата
+        uint32_t format_version = 1;
+        writePod(format_version);
+        
+        // Версия СУБД
+        writeString(metadata_.version);
+        
+        // Временные метки
+        writeString(metadata_.created_at);
+        writeString(metadata_.updated_at);
+        
+        // Корневая директория
+        writeString(root_dir_);
+        
+        // Текущая база данных
+        std::string current_db = current_db_ ? current_db_->name() : "";
+        writeString(current_db);
+        
+        // Количество баз данных
+        size_t db_count = databases_.size();
+        writePod(db_count);
+        
+        // Информация о базах данных
+        for (const auto& [db_name, db] : databases_) {
+            writeString(db_name);
+            writeString(db->getCreatedAt());
+            writeString(db->getUpdatedAt());
+        }
+
+        meta_file.close();
+        return true;
+    }
+
+    bool loadDBMSMetadata() {
+        std::string meta_path = root_dir_ + "/dbms.meta";
+        std::ifstream meta_file(meta_path, std::ios::binary);
+        if (!meta_file.is_open()) {
+            return false;
+        }
+
+        auto readPod = [&](auto& v) {
+            meta_file.read(reinterpret_cast<char*>(&v), sizeof(v));
+        };
+
+        auto readString = [&]() -> std::string {
+            size_t len = 0;
+            readPod(len);
+            std::string s(len, '\0');
+            if (len > 0) {
+                meta_file.read(s.data(), len);
+            }
+            return s;
+        };
+
+        // Проверяем сигнатуру
+        char signature[4];
+        meta_file.read(signature, 4);
+        if (signature[0] != 'D' || signature[1] != 'B' || 
+            signature[2] != 'M' || signature[3] != 'S') {
+            meta_file.close();
+            return false;
+        }
+        
+        // Версия формата
+        uint32_t format_version = 0;
+        readPod(format_version);
+        if (format_version != 1) {
+            meta_file.close();
+            return false;
+        }
+        
+        // Версия СУБД
+        metadata_.version = readString();
+        
+        // Временные метки
+        metadata_.created_at = readString();
+        metadata_.updated_at = readString();
+        
+        // Корневая директория (сверяем)
+        std::string stored_root = readString();
+        if (stored_root != root_dir_) {
+            std::cerr << "Warning: Root directory mismatch in metadata" << std::endl;
+        }
+        
+        // Текущая база данных
+        metadata_.current_database = readString();
+        
+        // Количество баз данных (пропускаем, базы загрузятся отдельно)
+        size_t db_count = 0;
+        readPod(db_count);
+        for (size_t i = 0; i < db_count; ++i) {
+            readString(); // db_name
+            readString(); // created_at
+            readString(); // updated_at
+        }
+
+        meta_file.close();
+        
+        // Загружаем базы данных
+        loadDatabases();
+        
+        // Восстанавливаем текущую базу данных
+        if (!metadata_.current_database.empty()) {
+            auto it = databases_.find(metadata_.current_database);
+            if (it != databases_.end()) {
+                current_db_ = it->second;
+            }
+        }
+        
+        return true;
+    }
+
     void loadDatabases() {
         for (const auto& entry : fs::directory_iterator(root_dir_)) {
             if (entry.is_directory()) {
@@ -856,6 +1237,7 @@ private:
     std::string root_dir_;
     std::unordered_map<std::string, std::shared_ptr<Database>> databases_;
     std::shared_ptr<Database> current_db_;
+    DBMSMetadata metadata_;
 };
 
 // ==================== SQL Executor ====================
