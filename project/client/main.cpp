@@ -12,6 +12,7 @@
 #include "../entrypoint/include/Server.h"
 
 void printHelp() {
+/*
     std::cout << "\n========================================\n";
     std::cout << "   SQL Database Engine (Client-Server)\n";
     std::cout << "========================================\n";
@@ -23,7 +24,7 @@ void printHelp() {
     std::cout << "  " << "storage_client host:port       - connect to specific server\n";
     std::cout << "  " << "storage_client script.sql host:port\n";
     std::cout << "========================================\n\n";
-//
+*/
     std::cout << "\n========================================\n";
     std::cout << "   Simple SQL Database Engine\n";
     std::cout << "========================================\n";
@@ -127,6 +128,7 @@ int main(int argc, char* argv[]) {
     } else {
         interactive = true;
         std::cout << "Interactive mode. Enter SQL commands (end with ';'):\n";
+        printHelp();
     }
 
     CommandReader reader(*input, interactive);
