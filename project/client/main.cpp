@@ -38,7 +38,7 @@ void printHelp() {
     std::cout << "  SELECT * FROM <table> [WHERE condition];\n";
     std::cout << "  UPDATE <table> SET col = value [WHERE condition];\n";
     std::cout << "  DELETE FROM <table> [WHERE condition];\n";
-    std::cout << "  REVERT <table> \"yyyy.mm.dd-hh:mm:ss.msmsms]\";\n";
+    std::cout << "  REVERT <table> \"yyyy.mm.dd-hh:mm:ss.msmsms\";\n";
     std::cout << "  EXIT; - quit the program\n";
     std::cout << "========================================\n\n";
 }
