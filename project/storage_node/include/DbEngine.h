@@ -13,6 +13,7 @@
 #include "../../common/include/AST.h"
 #include "../../common/include/Json.h"
 #include "../../common/include/Parser.h"
+#include "../../common/include/Json.h"
 
 #include "StorageNode.h"
 using Row = std::vector<Value>;
@@ -1351,23 +1352,17 @@ void executeStatement(const InsertStmt& stmt) {
         
         auto rows = table->selectRows(stmt.condition.get());
         
-        // Print results
-        for (const auto& row : rows) {
-            for (size_t i = 0; i < row.size(); ++i) {
-                if (i > 0) std::cout << " | ";
-                
-                if (std::holds_alternative<int>(row[i])) {
-                    std::cout << std::get<int>(row[i]);
-                } else if (std::holds_alternative<std::string>(row[i])) {
-                    std::cout << std::get<std::string>(row[i]);
-                } else {
-                    std::cout << "NULL";
-                }
-            }
-            std::cout << std::endl;
+        TableSchema schema;
+        for (const auto& col : table->metadata().columns) {
+            schema.columnNames.push_back(col.name);
         }
         
-        std::cout << rows.size() << " rows returned\n";
+        try {
+            std::string jsonOutput = formatSelectResult(stmt, rows, schema);
+            std::cout << jsonOutput << std::endl;
+        } catch (const std::exception& ex) {
+            std::cout << "Error in SELECT: " << ex.what() << std::endl;
+        }
     }
 
     void executeStatement(const UpdateStmt& stmt) {
