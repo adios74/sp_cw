@@ -88,6 +88,38 @@ std::pair<bool, InsertError> insertRow(const Row& input_row) {
     return {true, InsertError::OK};
 }
 
+std::pair<bool, InsertError> insertRow(const Row& input_row,
+                                       const std::vector<bool>& explicit_columns) {
+    auto row_opt = normalizeRow(input_row, explicit_columns);
+    if (!row_opt.has_value()) {
+        return {false, InsertError::UNKNOWN};
+    }
+
+    const Row& row = *row_opt;
+    if (!validateRowTypesAndConstraints(row)) {
+        for (size_t i = 0; i < row.size(); ++i) {
+            if (metadata_.columns[i].constraint == ColumnConstraint::NOT_NULL &&
+                std::holds_alternative<std::nullptr_t>(row[i])) {
+                return {false, InsertError::NOT_NULL_VIOLATION};
+            }
+            if (!isValueCompatibleWithColumn(row[i], metadata_.columns[i])) {
+                return {false, InsertError::TYPE_MISMATCH};
+            }
+        }
+        return {false, InsertError::UNKNOWN};
+    }
+
+    if (!checkUniqueConstraints(row, std::nullopt)) {
+        return {false, InsertError::DUPLICATE_KEY};
+    }
+
+    uint64_t row_id = metadata_.row_count++;
+    storage_.insert_string(row_id, serializeRow(row));
+    insertIntoUniqueIndexes(row, row_id);
+    saveMetadata();
+    return {true, InsertError::OK};
+}
+
     std::vector<Row> selectRows(const Expr* condition = nullptr) {
         std::vector<Row> result;
 
@@ -375,6 +407,12 @@ private:
     }
 
     std::optional<Row> normalizeRow(const Row& input_row) const {
+        std::vector<bool> explicit_cols(metadata_.columns.size(), false);
+        return normalizeRow(input_row, explicit_cols);
+    }
+
+    std::optional<Row> normalizeRow(const Row& input_row,
+                                    const std::vector<bool>& explicit_columns) const {
         if (input_row.size() > metadata_.columns.size()) {
             return std::nullopt;
         }
@@ -383,13 +421,13 @@ private:
         row.resize(metadata_.columns.size(), nullptr);
 
         for (size_t i = 0; i < metadata_.columns.size(); ++i) {
-            if (i >= input_row.size() || std::holds_alternative<std::nullptr_t>(row[i])) {
+            bool was_explicit = (i < explicit_columns.size()) ? explicit_columns[i] : false;
+            if (!was_explicit && std::holds_alternative<std::nullptr_t>(row[i])) {
                 if (metadata_.columns[i].default_value.has_value()) {
                     row[i] = *metadata_.columns[i].default_value;
                 }
             }
         }
-
         return row;
     }
 
@@ -1305,30 +1343,42 @@ void executeStatement(const InsertStmt& stmt) {
         return;
     }
 
+    const auto& columns = table->metadata().columns;
     size_t inserted = 0;
+
     for (size_t i = 0; i < stmt.values.size(); ++i) {
-        auto [ok, error] = table->insertRow(stmt.values[i]);
-        
+        Row fullRow(columns.size(), nullptr);
+        std::vector<bool> explicit_flags(columns.size(), false);
+
+        for (size_t j = 0; j < stmt.columns.size(); ++j) {
+            const std::string& colName = stmt.columns[j];
+            auto it = std::find_if(columns.begin(), columns.end(),
+                [&](const ColumnDef& c) { return c.name == colName; });
+            if (it == columns.end()) {
+                std::cout << "Error: Column " << colName << " not found\n";
+                return;
+            }
+            size_t colIdx = std::distance(columns.begin(), it);
+            fullRow[colIdx] = stmt.values[i][j];
+            explicit_flags[colIdx] = true; 
+        }
+
+        auto [ok, error] = table->insertRow(fullRow, explicit_flags);
         if (!ok) {
-            // Выводим понятную ошибку и ПРЕРЫВАЕМ операцию
             switch (error) {
                 case Table::InsertError::DUPLICATE_KEY:
-                    std::cout << "Error: Duplicate key value at row " 
-                              << (i + 1) << "\n";
+                    std::cout << "Error: Duplicate key value at row " << (i + 1) << "\n";
                     break;
                 case Table::InsertError::NOT_NULL_VIOLATION:
-                    std::cout << "Error: NOT NULL constraint failed at row " 
-                              << (i + 1) << "\n";
+                    std::cout << "Error: NOT NULL constraint failed at row " << (i + 1) << "\n";
                     break;
                 case Table::InsertError::TYPE_MISMATCH:
-                    std::cout << "Error: Type mismatch at row " 
-                              << (i + 1) << "\n";
+                    std::cout << "Error: Type mismatch at row " << (i + 1) << "\n";
                     break;
                 default:
-                    std::cout << "Error: Insert failed at row " 
-                              << (i + 1) << "\n";
+                    std::cout << "Error: Insert failed at row " << (i + 1) << "\n";
             }
-            return;  // Полностью отменяем операцию
+            return;
         }
         ++inserted;
     }
