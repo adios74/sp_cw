@@ -676,11 +676,22 @@ private:
                     std::string v = std::get<std::string>(val);
                     std::string p = std::get<std::string>(pattern);
                     
-                    if (p.ends_with("%")) {
-                        p.pop_back();
-                        return v.starts_with(p);
+                    bool starts_with_wildcard = p.starts_with("%");
+                    bool ends_with_wildcard   = p.ends_with("%");
+                    
+                    std::string core = p;
+                    if (starts_with_wildcard) core.erase(0, 1);
+                    if (ends_with_wildcard)   core.pop_back();
+                    
+                    if (starts_with_wildcard && ends_with_wildcard) {
+                        return v.find(core) != std::string::npos;
+                    } else if (starts_with_wildcard) {
+                        return v.size() >= core.size() && v.compare(v.size()-core.size(), core.size(), core) == 0;
+                    } else if (ends_with_wildcard) {
+                        return v.starts_with(core);
+                    } else {
+                        return v == core;
                     }
-                    return v == p;
                 }
                 return false;
             }
