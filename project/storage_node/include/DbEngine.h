@@ -1257,51 +1257,56 @@ private:
 
     void executeStatement(const CreateDatabaseStmt& stmt) {
         bool ok = dbms_.createDatabase(stmt.name);
-        std::cout << (ok ? "Database created\n" : "Failed to create database\n");
+        if (!ok) throw std::runtime_error("Failed to create database");
+        std::cout << "Database created\n";
     }
 
     void executeStatement(const DropDatabaseStmt& stmt) {
         bool ok = dbms_.dropDatabase(stmt.name);
-        std::cout << (ok ? "Database dropped\n" : "Failed to drop database\n");
+        if (!ok) throw std::runtime_error("Failed to drop database");
+        std::cout << "Database dropped\n";
     }
 
     void executeStatement(const UseStmt& stmt) {
         bool ok = dbms_.useDatabase(stmt.name);
-        std::cout << (ok ? "Using database\n" : "Database not found\n");
+        if (!ok) throw std::runtime_error("Database not found");
+        std::cout << "Using database\n";
     }
 
     void executeStatement(const CreateTableStmt& stmt) {
         auto db = dbms_.currentDatabase();
         if (!db) {
-            std::cout << "No database selected\n";
+            throw std::runtime_error("No database selected");
             return;
         }
         
         bool ok = db->createTable(stmt);
-        std::cout << (ok ? "Table created\n" : "Failed to create table\n");
+        if (!ok) throw std::runtime_error("Failed to create table");
+        std::cout << "Table created\n";
     }
 
     void executeStatement(const DropTableStmt& stmt) {
         auto db = dbms_.currentDatabase();
         if (!db) {
-            std::cout << "No database selected\n";
+            throw std::runtime_error("No database selected");
             return;
         }
         
         bool ok = db->dropTable(stmt.table.name);
-        std::cout << (ok ? "Table dropped\n" : "Failed to drop table\n");
+        if (!ok) throw std::runtime_error("Failed to drop table");
+        std::cout << "Table dropped\n";
     }
 
 void executeStatement(const InsertStmt& stmt) {
     auto db = dbms_.currentDatabase();
     if (!db) {
-        std::cout << "Error: No database selected\n";
+        throw std::runtime_error("No database selected");
         return;
     }
 
     auto table = db->getTable(stmt.table.name);
     if (!table) {
-        std::cout << "Error: Table not found\n";
+        throw std::runtime_error("Table not found");
         return;
     }
 
@@ -1310,25 +1315,21 @@ void executeStatement(const InsertStmt& stmt) {
         auto [ok, error] = table->insertRow(stmt.values[i]);
         
         if (!ok) {
-            // Выводим понятную ошибку и ПРЕРЫВАЕМ операцию
+            std::string msg;
             switch (error) {
                 case Table::InsertError::DUPLICATE_KEY:
-                    std::cout << "Error: Duplicate key value at row " 
-                              << (i + 1) << "\n";
+                    msg = "Duplicate key value at row " + std::to_string(i + 1);
                     break;
                 case Table::InsertError::NOT_NULL_VIOLATION:
-                    std::cout << "Error: NOT NULL constraint failed at row " 
-                              << (i + 1) << "\n";
+                    msg = "NOT NULL constraint failed at row " + std::to_string(i + 1);
                     break;
                 case Table::InsertError::TYPE_MISMATCH:
-                    std::cout << "Error: Type mismatch at row " 
-                              << (i + 1) << "\n";
+                    msg = "Type mismatch at row " + std::to_string(i + 1);
                     break;
                 default:
-                    std::cout << "Error: Insert failed at row " 
-                              << (i + 1) << "\n";
+                    msg = "Insert failed at row " + std::to_string(i + 1);
             }
-            return;  // Полностью отменяем операцию
+            throw std::runtime_error(msg);
         }
         ++inserted;
     }
@@ -1339,14 +1340,12 @@ void executeStatement(const InsertStmt& stmt) {
     void executeStatement(const SelectStmt& stmt) {
         auto db = dbms_.currentDatabase();
         if (!db) {
-            std::cout << "No database selected\n";
-            return;
+            throw std::runtime_error("No database selected");
         }
         
         auto table = db->getTable(stmt.table.name);
         if (!table) {
-            std::cout << "Table not found\n";
-            return;
+            throw std::runtime_error("Table not found");
         }
         
         auto rows = table->selectRows(stmt.condition.get());
@@ -1373,14 +1372,12 @@ void executeStatement(const InsertStmt& stmt) {
     void executeStatement(const UpdateStmt& stmt) {
         auto db = dbms_.currentDatabase();
         if (!db) {
-            std::cout << "No database selected\n";
-            return;
+            throw std::runtime_error("No database selected");
         }
         
         auto table = db->getTable(stmt.table.name);
         if (!table) {
-            std::cout << "Table not found\n";
-            return;
+            throw std::runtime_error("Table not found");
         }
         
         size_t updated = table->updateRows(stmt.assignments, stmt.condition.get());
@@ -1390,14 +1387,12 @@ void executeStatement(const InsertStmt& stmt) {
     void executeStatement(const DeleteStmt& stmt) {
         auto db = dbms_.currentDatabase();
         if (!db) {
-            std::cout << "No database selected\n";
-            return;
+            throw std::runtime_error("No database selected");
         }
         
         auto table = db->getTable(stmt.table.name);
         if (!table) {
-            std::cout << "Table not found\n";
-            return;
+            throw std::runtime_error("Table not found");
         }
         
         size_t deleted = table->deleteRows(stmt.condition.get());
