@@ -185,7 +185,8 @@ public:
             writePod(len);
             meta_file.write(s.data(), len);
         };
-        auto writeDBValue = [&](const DBValue& v) {
+        /*
+		auto writeDBValue = [&](const DBValue& v) {
             uint8_t tag = 0;
             if (v.is_null) tag = 0;
             else if (v.type == DataType::INT) tag = 1;
@@ -194,6 +195,8 @@ public:
             if (tag == 1) writePod(v.ival);
             else if (tag == 2) writeString(v.getString());
         };
+		*/
+
         writeString(metadata_.name);
         size_t col_count = metadata_.columns.size();
         writePod(col_count);
