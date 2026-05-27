@@ -17,9 +17,13 @@
 #include "Temporal.h"
 #include "StringPool.h"
 #include "types.h"
+#include "../../common/include/Json.h"
+
 #include "StorageNode.h"
 
 namespace fs = std::filesystem;
+
+using Row = std::vector<Value>;
 
 struct TableMetadata {
     std::string name;
@@ -36,15 +40,6 @@ private:
     std::unique_ptr<TemporalManager> temporal_;
 
 public:
-    static DBValue astToDBValue(const Value& v) {
-        if (std::holds_alternative<std::nullptr_t>(v))
-            return DBValue::null_of(DataType::INT);
-        if (std::holds_alternative<int>(v))
-            return DBValue::of_int(std::get<int>(v));
-        if (std::holds_alternative<std::string>(v))
-            return DBValue::of_str(std::get<std::string>(v));
-        return DBValue::null_of(DataType::INT);
-    }
 
     Table(const std::string& db_path, const TableMetadata& metadata)
         : metadata_(metadata),
@@ -58,53 +53,112 @@ public:
 
     const TableMetadata& metadata() const { return metadata_; }
 
-    enum class InsertError {
-        OK, DUPLICATE_KEY, NOT_NULL_VIOLATION, TYPE_MISMATCH, UNKNOWN
-    };
+enum class InsertError {
+    OK,
+    DUPLICATE_KEY,
+    NOT_NULL_VIOLATION,
+    TYPE_MISMATCH,
+    UNKNOWN
+};
 
-    std::pair<bool, InsertError> insertRow(const std::vector<DBValue>& input_row) {
-        auto row_opt = normalizeRow(input_row);
-        if (!row_opt) return {false, InsertError::UNKNOWN};
-        const auto& row = *row_opt;
-        if (!validateRowTypesAndConstraints(row)) {
-            for (size_t i = 0; i < row.size(); ++i) {
-                if (metadata_.columns[i].constraint == ColumnConstraint::NOT_NULL && row[i].is_null)
-                    return {false, InsertError::NOT_NULL_VIOLATION};
-                if (!isValueCompatibleWithColumn(row[i], metadata_.columns[i]))
-                    return {false, InsertError::TYPE_MISMATCH};
-            }
-            return {false, InsertError::UNKNOWN};
-        }
-        if (!checkUniqueConstraints(row, std::nullopt))
-            return {false, InsertError::DUPLICATE_KEY};
-
-        uint64_t row_id = metadata_.row_count++;
-        std::string serialized = serializeRow(row);
-        storage_.insert_string(row_id, serialized);
-        insertIntoUniqueIndexes(row, row_id);
-        temporal_->logInsert(row_id, serialized);
-        saveMetadata();
-        return {true, InsertError::OK};
+std::pair<bool, InsertError> insertRow(const Row& input_row) {
+    auto row_opt = normalizeRow(input_row);
+    if (!row_opt.has_value()) {
+        return {false, InsertError::UNKNOWN};
     }
 
-    std::vector<std::vector<DBValue>> selectRows(const Expr* condition = nullptr) {
-        std::vector<std::vector<DBValue>> result;
+    const Row& row = *row_opt;
+    if (!validateRowTypesAndConstraints(row)) {
+        // Определяем конкретную причину
+        for (size_t i = 0; i < row.size(); ++i) {
+            if (metadata_.columns[i].constraint == ColumnConstraint::NOT_NULL &&
+                std::holds_alternative<std::nullptr_t>(row[i])) {
+                return {false, InsertError::NOT_NULL_VIOLATION};
+            }
+            if (!isValueCompatibleWithColumn(row[i], metadata_.columns[i])) {
+                return {false, InsertError::TYPE_MISMATCH};
+            }
+        }
+        return {false, InsertError::UNKNOWN};
+    }
+
+    if (!checkUniqueConstraints(row, std::nullopt)) {
+        return {false, InsertError::DUPLICATE_KEY};
+    }
+
+    std::string serialized = serializeRow(row);
+    uint64_t row_id = metadata_.row_count++;
+    storage_.insert_string(row_id, serializeRow(row));
+    insertIntoUniqueIndexes(row, row_id);
+    temporal_->logInsert(row_id, serialized);
+    saveMetadata();
+    return {true, InsertError::OK};
+}
+
+std::pair<bool, InsertError> insertRow(const Row& input_row,
+                                       const std::vector<bool>& explicit_columns) {
+    auto row_opt = normalizeRow(input_row, explicit_columns);
+    if (!row_opt.has_value()) {
+        return {false, InsertError::UNKNOWN};
+    }
+
+    const Row& row = *row_opt;
+    if (!validateRowTypesAndConstraints(row)) {
+        for (size_t i = 0; i < row.size(); ++i) {
+            if (metadata_.columns[i].constraint == ColumnConstraint::NOT_NULL &&
+                std::holds_alternative<std::nullptr_t>(row[i])) {
+                return {false, InsertError::NOT_NULL_VIOLATION};
+            }
+            if (!isValueCompatibleWithColumn(row[i], metadata_.columns[i])) {
+                return {false, InsertError::TYPE_MISMATCH};
+            }
+        }
+        return {false, InsertError::UNKNOWN};
+    }
+
+    if (!checkUniqueConstraints(row, std::nullopt)) {
+        return {false, InsertError::DUPLICATE_KEY};
+    }
+
+  
+    std::string serialized = serializeRow(row);
+    uint64_t row_id = metadata_.row_count++;
+    storage_.insert_string(row_id, serializeRow(row));
+    insertIntoUniqueIndexes(row, row_id);
+    temporal_->logInsert(row_id, serialized);
+    saveMetadata();
+    return {true, InsertError::OK};
+}
+
+    std::vector<Row> selectRows(const Expr* condition = nullptr) {
+        std::vector<Row> result;
+
         for (uint64_t i = 0; i < metadata_.row_count; ++i) {
             auto rowData = storage_.find_string(i);
-            if (!rowData) continue;
-            auto row = deserializeRow(*rowData);
-            if (!condition || evaluateCondition(condition, row))
-                result.push_back(std::move(row));
+            if (!rowData.has_value()) {
+                continue;
+            }
+
+            Row row = deserializeRow(*rowData);
+            if (!condition || evaluateCondition(condition, row)) {
+                result.push_back(row);
+            }
         }
+
         return result;
     }
 
+
     size_t deleteRows(const Expr* condition = nullptr) {
         size_t deleted = 0;
+
         for (uint64_t i = 0; i < metadata_.row_count; ++i) {
             auto rowData = storage_.find_string(i);
-            if (!rowData) continue;
-            auto row = deserializeRow(*rowData);
+            if (!rowData.has_value()) {
+                continue;
+            }
+
+            Row row = deserializeRow(*rowData);
             if (!condition || evaluateCondition(condition, row)) {
                 temporal_->logDelete(i, *rowData);
                 removeFromUniqueIndexes(row);
@@ -112,40 +166,63 @@ public:
                 ++deleted;
             }
         }
+
         return deleted;
     }
 
-    size_t updateRows(const std::vector<std::pair<std::string, DBValue>>& assignments,
+    size_t updateRows(const std::vector<std::pair<std::string, Value>>& assignments,
                       const Expr* condition = nullptr) {
         size_t updated = 0;
-        for (uint64_t i = 0; i < metadata_.row_count; ++i) {
-            auto oldData = storage_.find_string(i);
-            if (!oldData) continue;
-            auto row = deserializeRow(*oldData);
-            if (condition && !evaluateCondition(condition, row)) continue;
 
-            auto new_row = row;
+        for (uint64_t i = 0; i < metadata_.row_count; ++i) {
+            auto rowData = storage_.find_string(i);
+            if (!rowData.has_value()) {
+                continue;
+            }
+
+            Row row = deserializeRow(*rowData);
+            if (condition && !evaluateCondition(condition, row)) {
+                continue;
+            }
+
+            Row new_row = row;
             bool assignment_failed = false;
-            for (const auto& [col, val] : assignments) {
-                int idx = getColumnIndex(col);
-                if (idx < 0) continue;
-                if (!isValueCompatibleWithColumn(val, metadata_.columns[idx])) {
+
+            for (const auto& [column, value] : assignments) {
+                int idx = getColumnIndex(column);
+                if (idx < 0) {
+                    continue;
+                }
+
+                Value resolved = value;
+                if (!isValueCompatibleWithColumn(resolved, metadata_.columns[idx])) {
                     assignment_failed = true;
                     break;
                 }
-                new_row[idx] = val;
+
+                new_row[idx] = resolved;
             }
-            if (assignment_failed) continue;
-            if (!validateRowTypesAndConstraints(new_row)) continue;
-            if (!checkUniqueConstraints(new_row, i)) continue;
+
+            if (assignment_failed) {
+                continue;
+            }
+
+            if (!validateRowTypesAndConstraints(new_row)) {
+                continue;
+            }
+
+            if (!checkUniqueConstraints(new_row, i)) {
+                continue;
+            }
 
             std::string newSerialized = serializeRow(new_row);
-            temporal_->logUpdate(i, *oldData, newSerialized);
+            temporal_->logUpdate(i, *rowData, newSerialized);
             removeFromUniqueIndexes(row);
-            storage_.insert_string(i, newSerialized);
+            storage_.insert_string(i, serializeRow(new_row));
             insertIntoUniqueIndexes(new_row, i);
             ++updated;
         }
+
         return updated;
     }
 
@@ -179,80 +256,348 @@ public:
             std::cerr << "Failed to save metadata for table: " << metadata_.name << std::endl;
             return;
         }
-        auto writePod = [&](const auto& v) { meta_file.write(reinterpret_cast<const char*>(&v), sizeof(v)); };
+
+        auto writePod = [&](const auto& v) {
+            meta_file.write(reinterpret_cast<const char*>(&v), sizeof(v));
+        };
+
         auto writeString = [&](const std::string& s) {
             size_t len = s.size();
             writePod(len);
             meta_file.write(s.data(), len);
         };
-        /*
-		auto writeDBValue = [&](const DBValue& v) {
-            uint8_t tag = 0;
-            if (v.is_null) tag = 0;
-            else if (v.type == DataType::INT) tag = 1;
-            else if (v.type == DataType::STRING) tag = 2;
-            writePod(tag);
-            if (tag == 1) writePod(v.ival);
-            else if (tag == 2) writeString(v.getString());
-        };
-		*/
 
+        auto writeValue = [&](const Value& v) {
+            uint8_t tag = 255;
+            if (std::holds_alternative<int>(v)) tag = 0;
+            else if (std::holds_alternative<std::string>(v)) tag = 1;
+            else if (std::holds_alternative<std::nullptr_t>(v)) tag = 2;
+            else if (std::holds_alternative<ColumnRef>(v)) tag = 3;
+
+            writePod(tag);
+
+            switch (tag) {
+                case 0: {
+                    int x = std::get<int>(v);
+                    writePod(x);
+                    break;
+                }
+                case 1: {
+                    writeString(std::get<std::string>(v));
+                    break;
+                }
+                case 2:
+                    break;
+                case 3: {
+                    const auto& r = std::get<ColumnRef>(v);
+                    writeString(r.database);
+                    writeString(r.table);
+                    writeString(r.column);
+                    break;
+                }
+                default:
+                    break;
+            }
+        };
+
+        // table name
         writeString(metadata_.name);
+
+        // columns
         size_t col_count = metadata_.columns.size();
         writePod(col_count);
         for (const auto& col : metadata_.columns) {
             writeString(col.name);
             writeString(col.type);
+
             uint8_t constraint = static_cast<uint8_t>(col.constraint);
             writePod(constraint);
-            // DEFAULT values temporarily disabled to avoid type conversion issues
-            bool has_default = false;
+
+            bool has_default = col.default_value.has_value();
             writePod(has_default);
-            // if (has_default) writeDBValue(astToDBValue(*col.default_value));
+            if (has_default) {
+                writeValue(*col.default_value);
+            }
         }
+
+        // row count
         writePod(metadata_.row_count);
         meta_file.close();
     }
 
     static std::optional<TableMetadata> loadMetadata(const std::string& meta_path) {
         std::ifstream meta_file(meta_path, std::ios::binary);
-        if (!meta_file.is_open()) return std::nullopt;
+        if (!meta_file.is_open()) {
+            return std::nullopt;
+        }
+
         TableMetadata metadata;
-        auto readPod = [&](auto& v) { meta_file.read(reinterpret_cast<char*>(&v), sizeof(v)); };
+
+        auto readPod = [&](auto& v) {
+            meta_file.read(reinterpret_cast<char*>(&v), sizeof(v));
+        };
+
         auto readString = [&]() -> std::string {
             size_t len = 0;
             readPod(len);
             std::string s(len, '\0');
-            if (len > 0) meta_file.read(s.data(), len);
+            if (len > 0) {
+                meta_file.read(s.data(), len);
+            }
             return s;
         };
+
+        auto readValue = [&]() -> Value {
+            uint8_t tag = 255;
+            readPod(tag);
+
+            switch (tag) {
+                case 0: {
+                    int x = 0;
+                    readPod(x);
+                    return x;
+                }
+                case 1: {
+                    return readString();
+                }
+                case 2:
+                    return nullptr;
+                case 3: {
+                    ColumnRef r;
+                    r.database = readString();
+                    r.table = readString();
+                    r.column = readString();
+                    return r;
+                }
+                default:
+                    return nullptr;
+            }
+        };
+
         metadata.name = readString();
+
         size_t col_count = 0;
         readPod(col_count);
         for (size_t i = 0; i < col_count; ++i) {
             ColumnDef col;
             col.name = readString();
             col.type = readString();
+
             uint8_t constraint = 0;
             readPod(constraint);
             col.constraint = static_cast<ColumnConstraint>(constraint);
+
             bool has_default = false;
             readPod(has_default);
             if (has_default) {
-                // Skip default value reading for now
-                uint8_t tag; readPod(tag);
-                if (tag == 1) { int32_t dummy; readPod(dummy); }
-                else if (tag == 2) { size_t len; readPod(len); meta_file.seekg(len, std::ios::cur); }
+                col.default_value = readValue();
             }
+
             metadata.columns.push_back(std::move(col));
         }
+
         readPod(metadata.row_count);
         meta_file.close();
         return metadata;
     }
 
 private:
+
     void initIndexedColumns() {
+        for (size_t i = 0; i < metadata_.columns.size(); ++i) {
+            if (metadata_.columns[i].constraint == ColumnConstraint::INDEXED) {
+                unique_indexes_[i] = std::make_unique<PageBasedIndex<std::string>>(*page_manager_);
+            }
+        }
+    }
+
+    void rebuildIndexesFromStorage() {
+        for (auto& [idx, index] : unique_indexes_) {
+            index->clear();
+        }
+
+        for (uint64_t row_id = 0; row_id < metadata_.row_count; ++row_id) {
+            auto rowData = storage_.find_string(row_id);
+            if (!rowData.has_value()) {
+                continue;
+            }
+
+            Row row = deserializeRow(*rowData);
+            for (const auto& [col_idx, index] : unique_indexes_) {
+                if (col_idx >= row.size()) {
+                    continue;
+                }
+
+                const Value& v = row[col_idx];
+                if (std::holds_alternative<std::nullptr_t>(v)) {
+                    continue;
+                }
+
+                std::string key = indexKey(v);
+                if (index->contains(key)) {
+                    throw std::runtime_error("Duplicate value found while rebuilding INDEXED constraint in table: " + metadata_.name);
+                }
+                index->insert_string(key, std::to_string(row_id));
+            }
+        }
+    }
+
+    std::optional<Row> normalizeRow(const Row& input_row) const {
+        std::vector<bool> explicit_cols(metadata_.columns.size(), false);
+        return normalizeRow(input_row, explicit_cols);
+    }
+
+    std::optional<Row> normalizeRow(const Row& input_row,
+                                    const std::vector<bool>& explicit_columns) const {
+        if (input_row.size() > metadata_.columns.size()) {
+            return std::nullopt;
+        }
+
+        Row row = input_row;
+        row.resize(metadata_.columns.size(), nullptr);
+
+        for (size_t i = 0; i < metadata_.columns.size(); ++i) {
+            bool was_explicit = (i < explicit_columns.size()) ? explicit_columns[i] : false;
+            if (!was_explicit && std::holds_alternative<std::nullptr_t>(row[i])) {
+                if (metadata_.columns[i].default_value.has_value()) {
+                    row[i] = *metadata_.columns[i].default_value;
+                }
+            }
+        }
+        return row;
+    }
+
+    bool isNullable(const ColumnDef& col) const {
+        return col.constraint == ColumnConstraint::NOT_NULL ||
+               col.constraint == ColumnConstraint::INDEXED
+                   ? false
+                   : true;
+    }
+
+    bool isIntType(const std::string& t) const {
+        std::string u = upper(t);
+        return u == "INT" || u == "INTEGER";
+    }
+
+    bool isStringType(const std::string& t) const {
+        std::string u = upper(t);
+        return u == "STRING" || u == "TEXT" || u == "VARCHAR";
+    }
+
+    std::string upper(std::string s) const {
+        for (char& c : s) {
+            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        }
+        return s;
+    }
+
+    bool isValueCompatibleWithColumn(const Value& v, const ColumnDef& col) const {
+        if (std::holds_alternative<std::nullptr_t>(v)) {
+            return isNullable(col);
+        }
+
+        if (isIntType(col.type)) {
+            return std::holds_alternative<int>(v);
+        }
+
+        if (isStringType(col.type)) {
+            return std::holds_alternative<std::string>(v);
+        }
+
+        // Если тип неизвестен — не ломаем существующий код, но и NULL не пропускаем.
+        return !std::holds_alternative<std::nullptr_t>(v);
+    }
+
+    bool validateRowTypesAndConstraints(const Row& row) const {
+        if (row.size() != metadata_.columns.size()) {
+            return false;
+        }
+
+        for (size_t i = 0; i < row.size(); ++i) {
+            if (!isValueCompatibleWithColumn(row[i], metadata_.columns[i])) {
+                return false;
+            }
+
+            if (metadata_.columns[i].constraint == ColumnConstraint::INDEXED &&
+                std::holds_alternative<std::nullptr_t>(row[i])) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    std::string indexKey(const Value& v) const {
+        if (std::holds_alternative<int>(v)) {
+            return "INT:" + std::to_string(std::get<int>(v));
+        }
+        if (std::holds_alternative<std::string>(v)) {
+            return "STR:" + std::get<std::string>(v);
+        }
+        throw std::runtime_error("INDEXED columns cannot be NULL or non-scalar");
+    }
+
+    bool checkUniqueConstraints(const Row& row, std::optional<uint64_t> current_row_id) const {
+        for (const auto& [col_idx, index] : unique_indexes_) {
+            if (col_idx >= row.size()) {
+                continue;
+            }
+
+            const Value& v = row[col_idx];
+            if (std::holds_alternative<std::nullptr_t>(v)) {
+                return false;
+            }
+
+            std::string key = indexKey(v);
+            auto existing = index->find_string(key);
+            if (!existing.has_value()) {
+                continue;
+            }
+
+            uint64_t existing_row_id = 0;
+            try {
+                existing_row_id = std::stoull(*existing);
+            } catch (...) {
+                return false;
+            }
+
+            if (!current_row_id.has_value() || existing_row_id != *current_row_id) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    void insertIntoUniqueIndexes(const Row& row, uint64_t row_id) {
+        for (const auto& [col_idx, index] : unique_indexes_) {
+            if (col_idx >= row.size()) {
+                continue;
+            }
+
+            const Value& v = row[col_idx];
+            std::string key = indexKey(v);
+            index->insert_string(key, std::to_string(row_id));
+        }
+    }
+
+    void removeFromUniqueIndexes(const Row& row) {
+        for (const auto& [col_idx, index] : unique_indexes_) {
+            if (col_idx >= row.size()) {
+                continue;
+            }
+
+            const Value& v = row[col_idx];
+            if (std::holds_alternative<std::nullptr_t>(v)) {
+                continue;
+            }
+
+            std::string key = indexKey(v);
+            index->remove(key);
+        }
+    }
+
+    int getColumnIndex(const std::string& column) const {
         for (size_t i = 0; i < metadata_.columns.size(); ++i) {
             if (metadata_.columns[i].constraint == ColumnConstraint::INDEXED) {
                 unique_indexes_[i] = std::make_unique<PageBasedIndex<std::string>>(*page_manager_);
@@ -456,16 +801,30 @@ private:
                 return false;
             }
             case Expr::LIKE: {
-                DBValue val = astToDBValue(expr->like.val);
-                DBValue pat = astToDBValue(expr->like.pattern);
-                if (val.type == DataType::STRING && pat.type == DataType::STRING) {
-                    const std::string& v = val.getString();
-                    std::string p = pat.getString();
-                    if (p.ends_with("%")) {
-                        p.pop_back();
-                        return v.starts_with(p);
+                Value val = resolveValue(expr->like.val, row);
+                Value pattern = resolveValue(expr->like.pattern, row);
+                
+                if (std::holds_alternative<std::string>(val) && 
+                    std::holds_alternative<std::string>(pattern)) {
+                    std::string v = std::get<std::string>(val);
+                    std::string p = std::get<std::string>(pattern);
+                    
+                    bool starts_with_wildcard = p.starts_with("%");
+                    bool ends_with_wildcard   = p.ends_with("%");
+                    
+                    std::string core = p;
+                    if (starts_with_wildcard) core.erase(0, 1);
+                    if (ends_with_wildcard)   core.pop_back();
+                    
+                    if (starts_with_wildcard && ends_with_wildcard) {
+                        return v.find(core) != std::string::npos;
+                    } else if (starts_with_wildcard) {
+                        return v.size() >= core.size() && v.compare(v.size()-core.size(), core.size(), core) == 0;
+                    } else if (ends_with_wildcard) {
+                        return v.starts_with(core);
+                    } else {
+                        return v == core;
                     }
-                    return v == p;
                 }
                 return false;
             }
@@ -513,6 +872,8 @@ public:
         }
         auto table = std::make_shared<Table>(db_path_, meta);
         tables_[meta.name] = table;
+        
+        // Обновляем метаданные базы данных
         metadata_.updated_at = getCurrentTimestamp();
         saveDatabaseMetadata();
         return true;
@@ -537,12 +898,19 @@ public:
         auto it = tables_.find(name);
         return it == tables_.end() ? nullptr : it->second;
     }
-
-    const std::string& getCreatedAt() const { return metadata_.created_at; }
-    const std::string& getUpdatedAt() const { return metadata_.updated_at; }
+    
+    const std::string& getCreatedAt() const {
+        return metadata_.created_at;
+    }
+    
+    const std::string& getUpdatedAt() const {
+        return metadata_.updated_at;
+    }
 
     void flush() {
-        for (auto& [name, table] : tables_) table->saveMetadata();
+        for (auto& [name, table] : tables_) {
+            table->saveMetadata();
+        }
         metadata_.updated_at = getCurrentTimestamp();
         saveDatabaseMetadata();
     }
@@ -557,34 +925,62 @@ private:
     std::string getCurrentTimestamp() {
         auto now = std::time(nullptr);
         std::string timestamp = std::ctime(&now);
-        if (!timestamp.empty() && timestamp.back() == '\n') timestamp.pop_back();
+        // Убираем символ новой строки в конце
+        if (!timestamp.empty() && timestamp.back() == '\n') {
+            timestamp.pop_back();
+        }
         return timestamp;
     }
 
     bool saveDatabaseMetadata() {
         std::string meta_path = db_path_ + "/database.meta";
         std::ofstream meta_file(meta_path, std::ios::binary);
-        if (!meta_file.is_open()) return false;
-        auto writePod = [&](const auto& v) { meta_file.write(reinterpret_cast<const char*>(&v), sizeof(v)); };
+        if (!meta_file.is_open()) {
+            std::cerr << "Failed to save database metadata: " << meta_path << std::endl;
+            return false;
+        }
+
+        auto writePod = [&](const auto& v) {
+            meta_file.write(reinterpret_cast<const char*>(&v), sizeof(v));
+        };
+
         auto writeString = [&](const std::string& s) {
             size_t len = s.size();
             writePod(len);
-            if (len > 0) meta_file.write(s.data(), len);
+            if (len > 0) {
+                meta_file.write(s.data(), len);
+            }
         };
+
+        // Сигнатура файла для проверки формата
         const char signature[4] = {'D', 'B', 'M', 'T'};
         meta_file.write(signature, 4);
+        
+        // Версия формата
         uint32_t format_version = 1;
         writePod(format_version);
+        
+        // Версия базы данных
         writeString(metadata_.version);
+        
+        // Имя базы данных
         writeString(name_);
+        
+        // Временные метки
         writeString(metadata_.created_at);
         writeString(metadata_.updated_at);
+        
+        // Количество таблиц
         size_t table_count = tables_.size();
         writePod(table_count);
+        
+        // Информация о таблицах
         for (const auto& [table_name, table] : tables_) {
             writeString(table_name);
             writePod(table->metadata().row_count);
             writePod(table->metadata().columns.size());
+            
+            // Сохраняем информацию о колонках для быстрой загрузки
             for (const auto& col : table->metadata().columns) {
                 writeString(col.name);
                 writeString(col.type);
@@ -592,6 +988,7 @@ private:
                 writePod(constraint);
             }
         }
+
         meta_file.close();
         return true;
     }
@@ -599,28 +996,60 @@ private:
     bool loadDatabaseMetadata() {
         std::string meta_path = db_path_ + "/database.meta";
         std::ifstream meta_file(meta_path, std::ios::binary);
-        if (!meta_file.is_open()) return false;
-        auto readPod = [&](auto& v) { meta_file.read(reinterpret_cast<char*>(&v), sizeof(v)); };
+        if (!meta_file.is_open()) {
+            return false;
+        }
+
+        auto readPod = [&](auto& v) {
+            meta_file.read(reinterpret_cast<char*>(&v), sizeof(v));
+        };
+
         auto readString = [&]() -> std::string {
             size_t len = 0;
             readPod(len);
             std::string s(len, '\0');
-            if (len > 0) meta_file.read(s.data(), len);
+            if (len > 0) {
+                meta_file.read(s.data(), len);
+            }
             return s;
         };
+
+        // Проверяем сигнатуру
         char signature[4];
         meta_file.read(signature, 4);
-        if (signature[0] != 'D' || signature[1] != 'B' || signature[2] != 'M' || signature[3] != 'T') return false;
+        if (signature[0] != 'D' || signature[1] != 'B' || 
+            signature[2] != 'M' || signature[3] != 'T') {
+            meta_file.close();
+            return false;
+        }
+        
+        // Версия формата
         uint32_t format_version = 0;
         readPod(format_version);
-        if (format_version != 1) return false;
+        if (format_version != 1) {
+            meta_file.close();
+            return false;
+        }
+        
+        // Версия базы данных
         metadata_.version = readString();
+        
+        // Имя базы данных (сверяем с текущим)
         std::string stored_name = readString();
-        if (stored_name != name_) std::cerr << "Warning: Database name mismatch in metadata" << std::endl;
+        if (stored_name != name_) {
+            std::cerr << "Warning: Database name mismatch in metadata" << std::endl;
+        }
+        
+        // Временные метки
         metadata_.created_at = readString();
         metadata_.updated_at = readString();
+        
+        // Количество таблиц (просто считываем, но не используем - таблицы загрузятся отдельно)
         size_t table_count = 0;
         readPod(table_count);
+        
+        // Пропускаем детальную информацию о таблицах, 
+        // так как таблицы загрузятся из своих собственных метафайлов
         for (size_t i = 0; i < table_count; ++i) {
             readString(); // table_name
             uint64_t dummy_row_count = 0;
@@ -634,19 +1063,28 @@ private:
                 readPod(dummy_constraint);
             }
         }
+
         meta_file.close();
+        
+        // Загружаем таблицы
         loadTables();
+        
         return true;
     }
 
     void loadTables() {
         for (const auto& entry : fs::directory_iterator(db_path_)) {
-            if (entry.path().extension() == ".meta" && entry.path().filename() != "database.meta") {
+            if (entry.path().extension() == ".meta") {
+                // Пропускаем метафайл самой базы данных
+                if (entry.path().filename() == "database.meta") {
+                    continue;
+                }
+                
                 auto metadata_opt = Table::loadMetadata(entry.path().string());
                 if (metadata_opt) {
                     auto table = std::make_shared<Table>(db_path_, *metadata_opt);
                     tables_[metadata_opt->name] = table;
-                    std::cout << "Loaded table: " << metadata_opt->name
+                    std::cout << "Loaded table: " << metadata_opt->name 
                               << " (" << metadata_opt->row_count << " rows)" << std::endl;
                 }
             }
@@ -693,10 +1131,22 @@ public:
 
     bool dropDatabase(const std::string& name) {
         auto it = databases_.find(name);
-        if (it == databases_.end()) return false;
-        if (current_db_ && current_db_->name() == name) current_db_.reset();
+        if (it == databases_.end()) {
+            return false;
+        }
+
+        // Если удаляем текущую БД, сбрасываем указатель
+        if (current_db_ && current_db_->name() == name) {
+            current_db_.reset();
+        }
+
         databases_.erase(it);
-        fs::remove_all(root_dir_ + "/" + name);
+        
+        std::string path = root_dir_ + "/" + name;
+        if (fs::exists(path)) {
+            fs::remove_all(path);
+        }
+        
         metadata_.updated_at = getCurrentTimestamp();
         saveDBMSMetadata();
         return true;
@@ -706,10 +1156,16 @@ public:
         auto it = databases_.find(name);
         if (it == databases_.end()) return false;
         current_db_ = it->second;
-        if (current_db_) metadata_.current_database = current_db_->name();
-        else metadata_.current_database.clear();
+        
+        // Сохраняем текущую БД в метаданных
+        if (current_db_) {
+            metadata_.current_database = current_db_->name();
+        } else {
+            metadata_.current_database.clear();
+        }
         metadata_.updated_at = getCurrentTimestamp();
         saveDBMSMetadata();
+        
         return true;
     }
 
@@ -717,15 +1173,28 @@ public:
         auto it = databases_.find(name);
         return it == databases_.end() ? nullptr : it->second;
     }
+    
+    const std::string& getRootDir() const {
+        return root_dir_;
+    }
 
-    std::shared_ptr<Database> currentDatabase() const { return current_db_; }
-    const std::string& getRootDir() const { return root_dir_; }
+    std::vector<std::string> getDatabaseList() const {
+        std::vector<std::string> db_list;
+        for (const auto& [name, _] : databases_) {
+            db_list.push_back(name);
+        }
+        return db_list;
+    }
 
     void flushAll() {
-        for (auto& [name, db] : databases_) db->flush();
+        for (auto& [name, db] : databases_) {
+            db->flush();
+        }
         metadata_.updated_at = getCurrentTimestamp();
         saveDBMSMetadata();
     }
+  
+    std::shared_ptr<Database> currentDatabase() const { return current_db_; }
 
 private:
     struct DBMSMetadata {
@@ -738,37 +1207,65 @@ private:
     std::string getCurrentTimestamp() {
         auto now = std::time(nullptr);
         std::string timestamp = std::ctime(&now);
-        if (!timestamp.empty() && timestamp.back() == '\n') timestamp.pop_back();
+        if (!timestamp.empty() && timestamp.back() == '\n') {
+            timestamp.pop_back();
+        }
         return timestamp;
     }
 
     bool saveDBMSMetadata() {
         std::string meta_path = root_dir_ + "/dbms.meta";
         std::ofstream meta_file(meta_path, std::ios::binary);
-        if (!meta_file.is_open()) return false;
-        auto writePod = [&](const auto& v) { meta_file.write(reinterpret_cast<const char*>(&v), sizeof(v)); };
+        if (!meta_file.is_open()) {
+            std::cerr << "Failed to save DBMS metadata: " << meta_path << std::endl;
+            return false;
+        }
+
+        auto writePod = [&](const auto& v) {
+            meta_file.write(reinterpret_cast<const char*>(&v), sizeof(v));
+        };
+
         auto writeString = [&](const std::string& s) {
             size_t len = s.size();
             writePod(len);
-            if (len > 0) meta_file.write(s.data(), len);
+            if (len > 0) {
+                meta_file.write(s.data(), len);
+            }
         };
+
+        // Сигнатура файла для проверки формата
         const char signature[4] = {'D', 'B', 'M', 'S'};
         meta_file.write(signature, 4);
+        
+        // Версия формата
         uint32_t format_version = 1;
         writePod(format_version);
+        
+        // Версия СУБД
         writeString(metadata_.version);
+        
+        // Временные метки
         writeString(metadata_.created_at);
         writeString(metadata_.updated_at);
+        
+        // Корневая директория
         writeString(root_dir_);
+        
+        // Текущая база данных
         std::string current_db = current_db_ ? current_db_->name() : "";
         writeString(current_db);
+        
+        // Количество баз данных
         size_t db_count = databases_.size();
         writePod(db_count);
+        
+        // Информация о базах данных
         for (const auto& [db_name, db] : databases_) {
             writeString(db_name);
             writeString(db->getCreatedAt());
             writeString(db->getUpdatedAt());
         }
+
         meta_file.close();
         return true;
     }
@@ -776,27 +1273,58 @@ private:
     bool loadDBMSMetadata() {
         std::string meta_path = root_dir_ + "/dbms.meta";
         std::ifstream meta_file(meta_path, std::ios::binary);
-        if (!meta_file.is_open()) return false;
-        auto readPod = [&](auto& v) { meta_file.read(reinterpret_cast<char*>(&v), sizeof(v)); };
+        if (!meta_file.is_open()) {
+            return false;
+        }
+
+        auto readPod = [&](auto& v) {
+            meta_file.read(reinterpret_cast<char*>(&v), sizeof(v));
+        };
+
         auto readString = [&]() -> std::string {
             size_t len = 0;
             readPod(len);
             std::string s(len, '\0');
-            if (len > 0) meta_file.read(s.data(), len);
+            if (len > 0) {
+                meta_file.read(s.data(), len);
+            }
             return s;
         };
+
+        // Проверяем сигнатуру
         char signature[4];
         meta_file.read(signature, 4);
-        if (signature[0] != 'D' || signature[1] != 'B' || signature[2] != 'M' || signature[3] != 'S') return false;
+        if (signature[0] != 'D' || signature[1] != 'B' || 
+            signature[2] != 'M' || signature[3] != 'S') {
+            meta_file.close();
+            return false;
+        }
+        
+        // Версия формата
         uint32_t format_version = 0;
         readPod(format_version);
-        if (format_version != 1) return false;
+        if (format_version != 1) {
+            meta_file.close();
+            return false;
+        }
+        
+        // Версия СУБД
         metadata_.version = readString();
+        
+        // Временные метки
         metadata_.created_at = readString();
         metadata_.updated_at = readString();
+        
+        // Корневая директория (сверяем)
         std::string stored_root = readString();
-        if (stored_root != root_dir_) std::cerr << "Warning: Root directory mismatch in metadata" << std::endl;
+        if (stored_root != root_dir_) {
+            std::cerr << "Warning: Root directory mismatch in metadata" << std::endl;
+        }
+        
+        // Текущая база данных
         metadata_.current_database = readString();
+        
+        // Количество баз данных (пропускаем, базы загрузятся отдельно)
         size_t db_count = 0;
         readPod(db_count);
         for (size_t i = 0; i < db_count; ++i) {
@@ -804,12 +1332,20 @@ private:
             readString(); // created_at
             readString(); // updated_at
         }
+
         meta_file.close();
+        
+        // Загружаем базы данных
         loadDatabases();
+        
+        // Восстанавливаем текущую базу данных
         if (!metadata_.current_database.empty()) {
             auto it = databases_.find(metadata_.current_database);
-            if (it != databases_.end()) current_db_ = it->second;
+            if (it != databases_.end()) {
+                current_db_ = it->second;
+            }
         }
+        
         return true;
     }
 
@@ -844,94 +1380,144 @@ private:
 
     void executeStatement(const CreateDatabaseStmt& stmt) {
         bool ok = dbms_.createDatabase(stmt.name);
-        std::cout << (ok ? "Database created\n" : "Failed to create database\n");
+        if (!ok) throw std::runtime_error("Failed to create database");
+        std::cout << "Database created\n";
     }
     void executeStatement(const DropDatabaseStmt& stmt) {
         bool ok = dbms_.dropDatabase(stmt.name);
-        std::cout << (ok ? "Database dropped\n" : "Failed to drop database\n");
+        if (!ok) throw std::runtime_error("Failed to drop database");
+        std::cout << "Database dropped\n";
     }
     void executeStatement(const UseStmt& stmt) {
         bool ok = dbms_.useDatabase(stmt.name);
-        std::cout << (ok ? "Using database\n" : "Database not found\n");
+        if (!ok) throw std::runtime_error("Database not found");
+        std::cout << "Using database\n";
     }
     void executeStatement(const CreateTableStmt& stmt) {
         auto db = dbms_.currentDatabase();
-        if (!db) { std::cout << "No database selected\n"; return; }
+        if (!db) {
+            throw std::runtime_error("No database selected");
+            return;
+        }
+        
         bool ok = db->createTable(stmt);
-        std::cout << (ok ? "Table created\n" : "Failed to create table\n");
+        if (!ok) throw std::runtime_error("Failed to create table");
+        std::cout << "Table created\n";
     }
     void executeStatement(const DropTableStmt& stmt) {
         auto db = dbms_.currentDatabase();
-        if (!db) { std::cout << "No database selected\n"; return; }
+        if (!db) {
+            throw std::runtime_error("No database selected");
+            return;
+        }
+        
         bool ok = db->dropTable(stmt.table.name);
-        std::cout << (ok ? "Table dropped\n" : "Failed to drop table\n");
+        if (!ok) throw std::runtime_error("Failed to drop table");
+        std::cout << "Table dropped\n";
     }
 
-    void executeStatement(const InsertStmt& stmt) {
-        auto db = dbms_.currentDatabase();
-        if (!db) { std::cout << "Error: No database selected\n"; return; }
-        auto table = db->getTable(stmt.table.name);
-        if (!table) { std::cout << "Error: Table not found\n"; return; }
-        size_t inserted = 0;
-        for (size_t i = 0; i < stmt.values.size(); ++i) {
-            std::vector<DBValue> dbRow;
-            for (const auto& astVal : stmt.values[i]) {
-                dbRow.push_back(Table::astToDBValue(astVal));
-            }
-            auto [ok, error] = table->insertRow(dbRow);
-            if (!ok) {
-                switch (error) {
-                    case Table::InsertError::DUPLICATE_KEY:
-                        std::cout << "Error: Duplicate key value at row " << (i+1) << "\n"; break;
-                    case Table::InsertError::NOT_NULL_VIOLATION:
-                        std::cout << "Error: NOT NULL constraint failed at row " << (i+1) << "\n"; break;
-                    case Table::InsertError::TYPE_MISMATCH:
-                        std::cout << "Error: Type mismatch at row " << (i+1) << "\n"; break;
-                    default:
-                        std::cout << "Error: Insert failed at row " << (i+1) << "\n";
-                }
+void executeStatement(const InsertStmt& stmt) {
+    auto db = dbms_.currentDatabase();
+    if (!db) {
+        throw std::runtime_error("No database selected");
+        return;
+    }
+
+    auto table = db->getTable(stmt.table.name);
+    if (!table) {
+        throw std::runtime_error("Table not found");
+        return;
+    }
+
+    const auto& columns = table->metadata().columns;
+    size_t inserted = 0;
+
+    for (size_t i = 0; i < stmt.values.size(); ++i) {
+        Row fullRow(columns.size(), nullptr);
+        std::vector<bool> explicit_flags(columns.size(), false);
+
+        for (size_t j = 0; j < stmt.columns.size(); ++j) {
+            const std::string& colName = stmt.columns[j];
+            auto it = std::find_if(columns.begin(), columns.end(),
+                [&](const ColumnDef& c) { return c.name == colName; });
+            if (it == columns.end()) {
+                std::cout << "Error: Column " << colName << " not found\n";
                 return;
             }
-			//StringPool::instance().dumpStats(); // DEBUG ДЕБАГ
-            ++inserted;
+            size_t colIdx = std::distance(columns.begin(), it);
+            fullRow[colIdx] = stmt.values[i][j];
+            explicit_flags[colIdx] = true; 
         }
-        std::cout << "Inserted " << inserted << " rows\n";
+
+        auto [ok, error] = table->insertRow(fullRow, explicit_flags);
+        if (!ok) {
+            std::string msg;
+            switch (error) {
+                case Table::InsertError::DUPLICATE_KEY:
+                    msg = "Duplicate key value at row " + std::to_string(i + 1);
+                    break;
+                case Table::InsertError::NOT_NULL_VIOLATION:
+                    msg = "NOT NULL constraint failed at row " + std::to_string(i + 1);
+                    break;
+                case Table::InsertError::TYPE_MISMATCH:
+                    msg = "Type mismatch at row " + std::to_string(i + 1);
+                    break;
+                default:
+                    msg = "Insert failed at row " + std::to_string(i + 1);
+            }
+            throw std::runtime_error(msg);
+        }
+        ++inserted;
     }
+
+    std::cout << "Inserted " << inserted << " rows\n";
+}
 
     void executeStatement(const SelectStmt& stmt) {
         auto db = dbms_.currentDatabase();
-        if (!db) { std::cout << "No database selected\n"; return; }
-        auto table = db->getTable(stmt.table.name);
-        if (!table) { std::cout << "Table not found\n"; return; }
-        auto rows = table->selectRows(stmt.condition.get());
-        for (const auto& row : rows) {
-            for (size_t i = 0; i < row.size(); ++i) {
-                if (i > 0) std::cout << " | ";
-                std::cout << row[i].to_display();
-            }
-            std::cout << std::endl;
+        if (!db) {
+            throw std::runtime_error("No database selected");
         }
-        std::cout << rows.size() << " rows returned\n";
+        
+        auto table = db->getTable(stmt.table.name);
+        if (!table) {
+            throw std::runtime_error("Table not found");
+        }
+        
+        auto rows = table->selectRows(stmt.condition.get());
+        
+        TableSchema schema;
+        for (const auto& col : table->metadata().columns) {
+            schema.columnNames.push_back(col.name);
+        }
+        
+        try {
+            std::string jsonOutput = formatSelectResult(stmt, rows, schema);
+            std::cout << jsonOutput << std::endl;
+        } catch (const std::exception& ex) {
+            std::cout << "Error in SELECT: " << ex.what() << std::endl;
+        }
     }
 
     void executeStatement(const UpdateStmt& stmt) {
         auto db = dbms_.currentDatabase();
-        if (!db) { std::cout << "No database selected\n"; return; }
-        auto table = db->getTable(stmt.table.name);
-        if (!table) { std::cout << "Table not found\n"; return; }
-        std::vector<std::pair<std::string, DBValue>> dbAssignments;
-        for (const auto& [col, val] : stmt.assignments) {
-            dbAssignments.emplace_back(col, Table::astToDBValue(val));
+        if (!db) {
+            throw std::runtime_error("No database selected");
         }
-        size_t updated = table->updateRows(dbAssignments, stmt.condition.get());
+        
+        auto table = db->getTable(stmt.table.name);
+        if (!table) {
+            throw std::runtime_error("Table not found");
+        }
+        size_t updated = table->updateRows(stmt.assignments, stmt.condition.get());
         std::cout << "Updated " << updated << " rows\n";
     }
 
     void executeStatement(const DeleteStmt& stmt) {
         auto db = dbms_.currentDatabase();
-        if (!db) { std::cout << "No database selected\n"; return; }
+        if (!db) throw std::runtime_error("No database selected");
         auto table = db->getTable(stmt.table.name);
-        if (!table) { std::cout << "Table not found\n"; return; }
+        if (!table) throw std::runtime_error("Table not found");
         size_t deleted = table->deleteRows(stmt.condition.get());
         std::cout << "Deleted " << deleted << " rows\n";
     }
@@ -943,13 +1529,11 @@ private:
         else
             db = dbms_.getDatabase(stmt.table.database);
         if (!db) {
-            std::cout << "Database not found\n";
-            return;
+            throw std::runtime_error("No database selected");
         }
         auto table = db->getTable(stmt.table.name);
         if (!table) {
-            std::cout << "Table not found\n";
-            return;
+            throw std::runtime_error("Table not found");
         }
         if (table->revertTo(stmt.timestamp))
             std::cout << "Table '" << stmt.table.name << "' reverted successfully\n";
