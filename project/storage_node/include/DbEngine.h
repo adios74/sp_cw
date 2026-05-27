@@ -236,7 +236,7 @@ public:
         metadata_.leaf_head_page_id = leaf_head_id;
 
         page_manager_->flush_all(); 
-        
+
         std::string meta_path = page_manager_->getFilePath() + ".meta";
         std::ofstream meta_file(meta_path, std::ios::binary);
         if (!meta_file.is_open()) {
@@ -1311,6 +1311,72 @@ public:
 private:
     DBMS& dbms_;
 
+    static void collectColumnRefs(const Expr* expr, std::vector<std::string>& out) {
+        if (!expr) return;
+        switch (expr->type) {
+            case Expr::COMPARISON: {
+                if (std::holds_alternative<ColumnRef>(expr->comparison.left))
+                    out.push_back(std::get<ColumnRef>(expr->comparison.left).column);
+                if (std::holds_alternative<ColumnRef>(expr->comparison.right))
+                    out.push_back(std::get<ColumnRef>(expr->comparison.right).column);
+                break;
+            }
+            case Expr::AND:
+            case Expr::OR:
+                collectColumnRefs(expr->left.get(), out);
+                collectColumnRefs(expr->right.get(), out);
+                break;
+            case Expr::NOT:
+                collectColumnRefs(expr->left.get(), out);
+                break;
+            case Expr::BETWEEN: {
+                if (std::holds_alternative<ColumnRef>(expr->between.val))
+                    out.push_back(std::get<ColumnRef>(expr->between.val).column);
+                if (std::holds_alternative<ColumnRef>(expr->between.start))
+                    out.push_back(std::get<ColumnRef>(expr->between.start).column);
+                if (std::holds_alternative<ColumnRef>(expr->between.end))
+                    out.push_back(std::get<ColumnRef>(expr->between.end).column);
+                break;
+            }
+            case Expr::LIKE: {
+                if (std::holds_alternative<ColumnRef>(expr->like.val))
+                    out.push_back(std::get<ColumnRef>(expr->like.val).column);
+                if (std::holds_alternative<ColumnRef>(expr->like.pattern))
+                    out.push_back(std::get<ColumnRef>(expr->like.pattern).column);
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    void validateColumnNames(const Table& table,
+                             const std::vector<std::string>& assignmentColumns,
+                             const Expr* condition) const {
+        const auto& columns = table.metadata().columns;
+        auto columnExists = [&](const std::string& name) {
+            return std::any_of(columns.begin(), columns.end(),
+                               [&](const ColumnDef& col) { return col.name == name; });
+        };
+
+        for (const auto& colName : assignmentColumns) {
+            if (!columnExists(colName)) {
+                throw std::runtime_error("Unknown column '" + colName +
+                                         "' in '" + table.metadata().name + "'");
+            }
+        }
+
+        if (condition) {
+            std::vector<std::string> condCols;
+            collectColumnRefs(condition, condCols);
+            for (const auto& colName : condCols) {
+                if (!columnExists(colName)) {
+                    throw std::runtime_error("Unknown column '" + colName +
+                                             "' in 'where clause'");
+                }
+            }
+        }
+    }
     void executeStatement(const RevertStmt& stmt) {
         std::shared_ptr<Database> db;
         if (stmt.table.database.empty())
@@ -1453,30 +1519,31 @@ private:
 
     void executeStatement(const UpdateStmt& stmt) {
         auto db = dbms_.currentDatabase();
-        if (!db) {
-            throw std::runtime_error("No database selected");
-        }
+        if (!db) throw std::runtime_error("No database selected");
         
         auto table = db->getTable(stmt.table.name);
-        if (!table) {
-            throw std::runtime_error("Table not found");
-        }
+        if (!table) throw std::runtime_error("Table not found");
         
+        std::vector<std::string> setColumns;
+        for (const auto& [col, _] : stmt.assignments) {
+            setColumns.push_back(col);
+        }
+
+        validateColumnNames(*table, setColumns, stmt.condition.get());
+
         size_t updated = table->updateRows(stmt.assignments, stmt.condition.get());
         std::cout << "Updated " << updated << " rows\n";
     }
 
     void executeStatement(const DeleteStmt& stmt) {
         auto db = dbms_.currentDatabase();
-        if (!db) {
-            throw std::runtime_error("No database selected");
-        }
+        if (!db) throw std::runtime_error("No database selected");
         
         auto table = db->getTable(stmt.table.name);
-        if (!table) {
-            throw std::runtime_error("Table not found");
-        }
+        if (!table) throw std::runtime_error("Table not found");
         
+        validateColumnNames(*table, {}, stmt.condition.get());
+
         size_t deleted = table->deleteRows(stmt.condition.get());
         std::cout << "Deleted " << deleted << " rows\n";
     }
