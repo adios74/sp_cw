@@ -1,4 +1,5 @@
 #include "Entrypoint.h"
+#include "Auth.h"
 #include <iostream>
 #include <sstream>
 #include <algorithm>
@@ -17,6 +18,9 @@ void Entrypoint::start() {
     server_fd_ = listener.getFd();
     running_ = true;
     std::cout << "Entrypoint listening for clients on port " << client_port_ << std::endl;
+
+    // При желании здесь можно задать дефолтные права для новых баз данных
+    // auth_.setDefaultDBPermissions("mydb", (uint8_t)Operation::READ | (uint8_t)Operation::WRITE);
 
     while (running_) {
         try {
@@ -156,6 +160,14 @@ std::string Entrypoint::extractDatabaseName(const std::string& sql, const std::s
         return sql.substr(start + keyword_end, name_end - keyword_end);
     }
     
+    if (upper.starts_with("DROP DATABASE ") || upper.starts_with("DROP DATABASE\n")) {
+        size_t keyword_end = upper.find_first_not_of(" \t", 13);
+        if (keyword_end == std::string::npos) return "";
+        size_t name_end = upper.find_first_of(" ;\t\n\r", keyword_end);
+        if (name_end == std::string::npos) name_end = upper.size();
+        return sql.substr(start + keyword_end, name_end - keyword_end);
+    }
+    
     if (upper.starts_with("USE ")) {
         size_t p = upper.find_first_of(" \t", 4);
         if (p != std::string::npos) {
@@ -177,7 +189,8 @@ void Entrypoint::handleClient(int client_fd) {
     client.setFd(client_fd);
     std::string buffer;
     std::string current_db;
-    
+    std::string current_user;   // имя пользователя после успешного BEARER
+
     std::cerr << "[Entrypoint] New client connected, fd=" << client_fd << std::endl;
     
     while (true) {
@@ -205,147 +218,229 @@ void Entrypoint::handleClient(int client_fd) {
                 std::string upper_cmd = command;
                 std::transform(upper_cmd.begin(), upper_cmd.end(), upper_cmd.begin(), ::toupper);
                 
-                // ADD STORAGE
-                if (upper_cmd.find("ADD STORAGE") == 0) {
-                    std::cerr << "[Entrypoint] ADD STORAGE command" << std::endl;
-                    std::regex add_regex(R"(ADD STORAGE\s+\"([^\"]+):(\d+)\")");
-                    std::smatch m;
-                    if (std::regex_search(command, m, add_regex)) {
-                        std::string host = m[1].str();
-                        int port = std::stoi(m[2].str());
-                        std::cerr << "[Entrypoint] Adding storage: " << host << ":" << port << std::endl;
-                        addStorageNode(host, port);
-                        std::string response = "Storage node added\n";
-                        client.send(response);
-                        std::cerr << "[Entrypoint] Sent: " << response;
+                // ------------- Аутентификация -------------
+                if (upper_cmd.find("LOGIN") == 0 && current_user.empty()) {
+                    if (command.back() == ';') command.pop_back(); 
+                    std::istringstream iss(command);
+                    std::string cmd, username, password;
+                    iss >> cmd >> username >> password;
+                    std::string token = auth_.login(username, password);
+                    if (token.empty()) {
+                        client.send("Error: authentication failed\n");
                     } else {
-                        std::string error = "Error: usage ADD STORAGE \"host:port\"\n";
-                        client.send(error);
-                        std::cerr << "[Entrypoint] Sent error: " << error;
+                        client.send("TOKEN " + token + "\n");
                     }
-                    continue;
-                }
-                
-                // REMOVE STORAGE
-                if (upper_cmd.find("REMOVE STORAGE") == 0) {
-                    std::cerr << "[Entrypoint] REMOVE STORAGE command" << std::endl;
-                    std::regex rem_regex(R"(REMOVE STORAGE\s+\"([^\"]+):(\d+)\")");
-                    std::smatch m;
-                    if (std::regex_search(command, m, rem_regex)) {
-                        std::string host = m[1].str();
-                        int port = std::stoi(m[2].str());
-                        std::cerr << "[Entrypoint] Removing storage: " << host << ":" << port << std::endl;
-                        removeStorageNode(host, port);
-                        client.send("Storage node removed\n");
-                    } else {
-                        client.send("Error: usage REMOVE STORAGE \"host:port\"\n");
-                    }
-                    continue;
-                }
-                
-                // SHOW STORAGES
-                if (upper_cmd.find("SHOW STORAGES") == 0) {
-                    std::cerr << "[Entrypoint] SHOW STORAGES command" << std::endl;
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    std::stringstream ss;
-                    for (const auto& node : storage_nodes_)
-                        ss << node.first << ":" << node.second << "\n";
-                    std::string response = ss.str();
-                    if (response.empty()) response = "No storage nodes\n";
-                    client.send(response);
-                    std::cerr << "[Entrypoint] Sent storage list: " << response;
                     continue;
                 }
 
-                // Extract database name for other commands
+if (upper_cmd.find("BEARER ") == 0 && current_user.empty()) {
+    std::cerr << "[DEBUG] BEARER command received" << std::endl;
+
+    std::string token = command.substr(7);
+    // удаляем ';' в конце, если есть
+    if (!token.empty() && token.back() == ';') token.pop_back();
+    // обрезаем пробелы
+    size_t start = token.find_first_not_of(" \t");
+    size_t end = token.find_last_not_of(" \t");
+    if (start != std::string::npos)
+        token = token.substr(start, end - start + 1);
+
+    std::cerr << "[DEBUG] Token after cleanup: '" << token << "'" << std::endl;
+
+    std::string user = auth_.validateToken(token);
+    std::cerr << "[DEBUG] validateToken returned: '" << user << "'" << std::endl;
+
+    if (user.empty()) {
+        std::cerr << "[DEBUG] Token invalid or expired" << std::endl;
+        client.send("Error: invalid or expired token\n");
+    } else {
+        current_user = user;
+        std::cerr << "[DEBUG] User authenticated: " << current_user << std::endl;
+        client.send("OK\n");
+        std::cerr << "[DEBUG] Sent 'OK' to client" << std::endl;
+    }
+    continue;
+}
+
+                if (current_user.empty()) {
+                    client.send("Error: authentication required (use LOGIN then BEARER)\n");
+                    continue;
+                }
+                
+                // ------------- Извлечение имени БД -------------
                 std::string db_name = extractDatabaseName(command, current_db);
                 std::cerr << "[Entrypoint] Database name: '" << db_name << "'" << std::endl;
 
-                // CREATE DATABASE
-                if (upper_cmd.find("CREATE DATABASE") == 0) {
-                    std::cerr << "[Entrypoint] CREATE DATABASE detected" << std::endl;
-                    std::cerr << "[Entrypoint] db_name = '" << db_name << "'" << std::endl;
-                    std::cerr << "[Entrypoint] db_name.empty() = " << db_name.empty() << std::endl;
+                // ------------- Проверка прав и выполнение -------------
+                
+                // 1. Административные команды кластера
+                if (upper_cmd.find("ADD STORAGE") == 0 ||
+                    upper_cmd.find("REMOVE STORAGE") == 0 ||
+                    upper_cmd.find("SHOW STORAGES") == 0) {
                     
+                    if (!auth_.checkPermission(current_user, "", Operation::ADMIN)) {
+                        client.send("Error: administrator privileges required\n");
+                        continue;
+                    }
+                    
+                    // Обработка ADD STORAGE
+                    if (upper_cmd.find("ADD STORAGE") == 0) {
+                        std::regex add_regex(R"(ADD STORAGE\s+\"([^\"]+):(\d+)\")");
+                        std::smatch m;
+                        if (std::regex_search(command, m, add_regex)) {
+                            std::string host = m[1].str();
+                            int port = std::stoi(m[2].str());
+                            addStorageNode(host, port);
+                            client.send("Storage node added\n");
+                        } else {
+                            client.send("Error: usage ADD STORAGE \"host:port\"\n");
+                        }
+                    }
+                    // Обработка REMOVE STORAGE
+                    else if (upper_cmd.find("REMOVE STORAGE") == 0) {
+                        std::regex rem_regex(R"(REMOVE STORAGE\s+\"([^\"]+):(\d+)\")");
+                        std::smatch m;
+                        if (std::regex_search(command, m, rem_regex)) {
+                            std::string host = m[1].str();
+                            int port = std::stoi(m[2].str());
+                            removeStorageNode(host, port);
+                            client.send("Storage node removed\n");
+                        } else {
+                            client.send("Error: usage REMOVE STORAGE \"host:port\"\n");
+                        }
+                    }
+                    // Обработка SHOW STORAGES
+                    else {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        std::stringstream ss;
+                        for (const auto& node : storage_nodes_)
+                            ss << node.first << ":" << node.second << "\n";
+                        std::string response = ss.str();
+                        if (response.empty()) response = "No storage nodes\n";
+                        client.send(response);
+                    }
+                    continue;
+                }
+                
+                // 2. USE – смена текущей БД
+                if (upper_cmd.find("USE ") == 0) {
+                    current_db = db_name;
+                    client.send("Using database " + current_db + "\n");
+                    continue;
+                }
+                
+                // 3. CREATE DATABASE
+                if (upper_cmd.find("CREATE DATABASE") == 0) {
+                    if (!auth_.checkPermission(current_user, "", Operation::CREATE_DATABASE)) {
+                        client.send("Error: permission denied (CREATE DATABASE)\n");
+                        continue;
+                    }
                     if (db_name.empty()) {
-                        std::cerr << "[Entrypoint] Database name is empty, sending error" << std::endl;
                         client.send("Error: invalid database name\n");
                         continue;
                     }
                     
-                    std::cerr << "[Entrypoint] Acquiring mutex lock..." << std::endl;
                     std::pair<std::string, int> target;
                     {
                         std::lock_guard<std::mutex> lock(mutex_);
-                        std::cerr << "[Entrypoint] Mutex lock acquired" << std::endl;
-                        
-                        std::cerr << "[Entrypoint] Checking if database exists: " << db_name << std::endl;
                         if (db_to_storage_.count(db_name)) {
-                            std::cerr << "[Entrypoint] Database already exists!" << std::endl;
                             client.send("Error: database already exists\n");
                             continue;
                         }
-                        
-                        std::cerr << "[Entrypoint] Checking storage_nodes_.empty() = " << storage_nodes_.empty() << std::endl;
                         if (storage_nodes_.empty()) {
-                            std::cerr << "[Entrypoint] No storage nodes available!" << std::endl;
                             client.send("Error: no storage nodes available\n");
                             continue;
                         }
-                        
-                        std::cerr << "[Entrypoint] Calling chooseStorageForNewDB()..." << std::endl;
                         target = chooseStorageForNewDB();
-                        std::cerr << "[Entrypoint] Storage chosen: " << target.first << ":" << target.second << std::endl;
-                        
                         db_to_storage_[db_name] = target;
-                        std::cerr << "[Entrypoint] Database mapped to storage" << std::endl;
                     }
-                    std::cerr << "[Entrypoint] Mutex released" << std::endl;
-                    
-                    std::cerr << "[Entrypoint] Calling forwardToStorage..." << std::endl;
                     std::string response = forwardToStorage(target.first, target.second, command);
-                    std::cerr << "[Entrypoint] forwardToStorage returned, response size=" << response.size() << std::endl;
-                    std::cerr << "[Entrypoint] Response content: " << response << std::endl;
+                    client.send(response);
+                    continue;
+                }
+                
+                // 4. DROP DATABASE
+                if (upper_cmd.find("DROP DATABASE") == 0) {
+                    if (!auth_.checkPermission(current_user, db_name, Operation::DELETE_DATABASE)) {
+                        client.send("Error: permission denied (DROP DATABASE)\n");
+                        continue;
+                    }
+                    if (db_name.empty()) {
+                        client.send("Error: no database specified\n");
+                        continue;
+                    }
                     
+                    std::pair<std::string, int> target;
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        auto it = db_to_storage_.find(db_name);
+                        if (it == db_to_storage_.end()) {
+                            client.send("Error: database not found\n");
+                            continue;
+                        }
+                        target = it->second;
+                        // Удаляем из маппинга после успешного выполнения на storage,
+                        // но если storage вернёт ошибку, то маппинг останется. Можно оптимизировать.
+                    }
+                    
+                    std::string response = forwardToStorage(target.first, target.second, command);
+                    // Если storage сообщил об успехе (например, "Database dropped"), удаляем маппинг
+                    if (response.find("Database dropped") != std::string::npos ||
+                        response.find("dropped") != std::string::npos) {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        db_to_storage_.erase(db_name);
+                        // Если текущая БД удалена, сбрасываем current_db
+                        if (current_db == db_name) current_db.clear();
+                    }
                     client.send(response);
-                    std::cerr << "[Entrypoint] Response sent to client" << std::endl;
                     continue;
                 }
-
-                // USE
-                if (upper_cmd.find("USE ") == 0) {
-                    current_db = db_name;
-                    std::string response = "Using database " + current_db + "\n";
-                    client.send(response);
-                    std::cerr << "[Entrypoint] Sent: " << response;
-                    continue;
-                }
-
-                // For other SQL commands (SELECT, INSERT, UPDATE, DELETE, etc.)
+                
+                // 5. CREATE TABLE / DROP TABLE / SELECT / INSERT / UPDATE / DELETE
+                // Требуют существующей БД и проверки прав
                 if (db_name.empty()) {
-                    std::string error = "Error: no database selected or specified\n";
-                    client.send(error);
-                    std::cerr << "[Entrypoint] Sent error: " << error;
+                    client.send("Error: no database selected or specified\n");
                     continue;
                 }
-
+                
+                // Получаем целевой storage
                 std::pair<std::string, int> target;
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
                     auto it = db_to_storage_.find(db_name);
                     if (it == db_to_storage_.end()) {
-                        std::string error = "Error: database '" + db_name + "' not found\n";
-                        client.send(error);
-                        std::cerr << "[Entrypoint] Sent error: " << error;
+                        client.send("Error: database '" + db_name + "' not found\n");
                         continue;
                     }
                     target = it->second;
                 }
-
-                std::cerr << "[Entrypoint] Forwarding SQL to storage: " << target.first << ":" << target.second << std::endl;
+                
+                // Определяем операцию и проверяем права
+                bool allowed = false;
+                if (upper_cmd.find("CREATE TABLE") == 0) {
+                    allowed = auth_.checkPermission(current_user, db_name, Operation::CREATE_TABLE);
+                } else if (upper_cmd.find("DROP TABLE") == 0) {
+                    allowed = auth_.checkPermission(current_user, db_name, Operation::DROP_TABLE);
+                } else if (upper_cmd.find("SELECT") == 0) {
+                    allowed = auth_.checkPermission(current_user, db_name, Operation::READ);
+                } else if (upper_cmd.find("INSERT") == 0 ||
+                           upper_cmd.find("UPDATE") == 0 ||
+                           upper_cmd.find("DELETE") == 0) {
+                    allowed = auth_.checkPermission(current_user, db_name, Operation::WRITE);
+                } else {
+                    // Неизвестная команда
+                    client.send("Error: unsupported command\n");
+                    continue;
+                }
+                
+                if (!allowed) {
+                    client.send("Error: permission denied\n");
+                    continue;
+                }
+                
+                // Пересылка на storage
                 std::string response = forwardToStorage(target.first, target.second, command);
                 client.send(response);
-                std::cerr << "[Entrypoint] Response sent to client" << std::endl;
             }
         } catch (const std::exception& e) {
             std::cerr << "Client handler error: " << e.what() << std::endl;

@@ -9,6 +9,7 @@
 #include <mutex>
 #include <deque>
 #include "Network.h"      // предполагается, что Socket уже есть
+#include "Auth.h"
 
 class Entrypoint {
 public:
@@ -24,7 +25,7 @@ public:
 
 private:
     void handleClient(int client_fd);
-    
+    AuthManager auth_;
     // Отправляет SQL-команду на указанный Storage и возвращает ответ
     std::string forwardToStorage(const std::string& host, int port, const std::string& sql);
     
