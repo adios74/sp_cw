@@ -10,6 +10,7 @@
 #include "DbEngine.h"
 #include "../common/include/Network.h"
 #include "../entrypoint/include/Server.h"
+#include "../entrypoint/include/Entrypoint.h"
 
 void printHelp() {
 /*
@@ -73,11 +74,24 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // --- Режим сервера ---
+    // --- Режим Entrypoint ---
+    if (argc >= 2 && std::string(argv[1]) == "--entrypoint") {
+        int port = 8080;
+        if (argc >= 3) port = std::stoi(argv[2]);
+        Entrypoint entry(port);
+        // Опционально: автоматически добавить начальные Storage-узлы
+        // entry.addStorageNode("127.0.0.1", 9001);
+        // entry.addStorageNode("127.0.0.1", 9002);
+        entry.start();
+        return 0;
+    }
+
     if (argc >= 2 && std::string(argv[1]) == "--server") {
         int port = 12345;
+        std::string db_path = "./database_data";
         if (argc >= 3) port = std::stoi(argv[2]);
-        Server server(port, "./database_data");
+        if (argc >= 4) db_path = argv[3];
+        Server server(port, db_path);
         server.start();
         return 0;
     }
