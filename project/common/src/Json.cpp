@@ -152,7 +152,7 @@ std::string formatSelectResult(const SelectStmt& stmt,
                 }
             }
         }
-        return resultObj.dump();
+        return resultObj.dump(4);
     }
 
     json jsonArray = json::array();
@@ -163,5 +163,5 @@ std::string formatSelectResult(const SelectStmt& stmt,
         }
         jsonArray.push_back(rowObj);
     }
-    return jsonArray.dump();
+    return jsonArray.dump(4);
 }
