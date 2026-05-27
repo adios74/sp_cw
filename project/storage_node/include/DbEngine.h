@@ -9,6 +9,8 @@
 #include <fstream>
 #include <iostream>
 #include <optional>
+#include <chrono>
+#include <ctime>
 
 #include "Temporal.h"
 #include "StringPool.h"
@@ -17,9 +19,9 @@
 #include "../../common/include/AST.h"
 #include "../../common/include/Json.h"
 #include "../../common/include/Parser.h"
-#include "../../common/include/Json.h"
 
 #include "StorageNode.h"
+
 using Row = std::vector<Value>;
 
 namespace fs = std::filesystem;
@@ -28,6 +30,8 @@ struct TableMetadata {
     std::string name;
     std::vector<ColumnDef> columns;
     uint64_t row_count = 0;
+    uint64_t root_page_id = 0;
+    uint64_t leaf_head_page_id = 0;
 };
 
 class Table {
@@ -36,8 +40,6 @@ private:
     std::unique_ptr<PageManager> page_manager_;
     PageBasedIndex<uint64_t> storage_;
     std::unique_ptr<TemporalManager> temporal_;
-
-    // Уникальные индексы для колонок с constraint == INDEXED
     std::unordered_map<size_t, std::unique_ptr<PageBasedIndex<std::string>>> unique_indexes_;
 
 public:
@@ -45,7 +47,11 @@ public:
         : metadata_(metadata),
           page_manager_(std::make_unique<PageManager>(db_path + "/" + metadata.name + ".tbl")),
           storage_(*page_manager_),
-          temporal_(std::make_unique<TemporalManager>(db_path + "/" + metadata.name + ".log"))  {
+          temporal_(std::make_unique<TemporalManager>(db_path + "/" + metadata.name + ".log"))
+    {
+        if (metadata_.root_page_id != 0) {
+            storage_.load_metadata(metadata_.root_page_id, metadata_.leaf_head_page_id);
+        }
         initIndexedColumns();
         rebuildIndexesFromStorage();
         saveMetadata();
@@ -55,79 +61,78 @@ public:
         return metadata_; 
     }
 
-enum class InsertError {
-    OK,
-    DUPLICATE_KEY,
-    NOT_NULL_VIOLATION,
-    TYPE_MISMATCH,
-    UNKNOWN
-};
+    enum class InsertError {
+        OK,
+        DUPLICATE_KEY,
+        NOT_NULL_VIOLATION,
+        TYPE_MISMATCH,
+        UNKNOWN
+    };
 
-std::pair<bool, InsertError> insertRow(const Row& input_row) {
-    auto row_opt = normalizeRow(input_row);
-    if (!row_opt.has_value()) {
-        return {false, InsertError::UNKNOWN};
-    }
-
-    const Row& row = *row_opt;
-    if (!validateRowTypesAndConstraints(row)) {
-        // Определяем конкретную причину
-        for (size_t i = 0; i < row.size(); ++i) {
-            if (metadata_.columns[i].constraint == ColumnConstraint::NOT_NULL &&
-                std::holds_alternative<std::nullptr_t>(row[i])) {
-                return {false, InsertError::NOT_NULL_VIOLATION};
-            }
-            if (!isValueCompatibleWithColumn(row[i], metadata_.columns[i])) {
-                return {false, InsertError::TYPE_MISMATCH};
-            }
+    std::pair<bool, InsertError> insertRow(const Row& input_row) {
+        auto row_opt = normalizeRow(input_row);
+        if (!row_opt.has_value()) {
+            return {false, InsertError::UNKNOWN};
         }
-        return {false, InsertError::UNKNOWN};
-    }
 
-    if (!checkUniqueConstraints(row, std::nullopt)) {
-        return {false, InsertError::DUPLICATE_KEY};
-    }
-
-    uint64_t row_id = metadata_.row_count++;
-    storage_.insert_string(row_id, serializeRow(row));
-    insertIntoUniqueIndexes(row, row_id);
-    temporal_->logInsert(row_id, serializeRow(row));
-    saveMetadata();
-    return {true, InsertError::OK};
-}
-
-std::pair<bool, InsertError> insertRow(const Row& input_row,
-                                       const std::vector<bool>& explicit_columns) {
-    auto row_opt = normalizeRow(input_row, explicit_columns);
-    if (!row_opt.has_value()) {
-        return {false, InsertError::UNKNOWN};
-    }
-
-    const Row& row = *row_opt;
-    if (!validateRowTypesAndConstraints(row)) {
-        for (size_t i = 0; i < row.size(); ++i) {
-            if (metadata_.columns[i].constraint == ColumnConstraint::NOT_NULL &&
-                std::holds_alternative<std::nullptr_t>(row[i])) {
-                return {false, InsertError::NOT_NULL_VIOLATION};
+        const Row& row = *row_opt;
+        if (!validateRowTypesAndConstraints(row)) {
+            for (size_t i = 0; i < row.size(); ++i) {
+                if (metadata_.columns[i].constraint == ColumnConstraint::NOT_NULL &&
+                    std::holds_alternative<std::nullptr_t>(row[i])) {
+                    return {false, InsertError::NOT_NULL_VIOLATION};
+                }
+                if (!isValueCompatibleWithColumn(row[i], metadata_.columns[i])) {
+                    return {false, InsertError::TYPE_MISMATCH};
+                }
             }
-            if (!isValueCompatibleWithColumn(row[i], metadata_.columns[i])) {
-                return {false, InsertError::TYPE_MISMATCH};
-            }
+            return {false, InsertError::UNKNOWN};
         }
-        return {false, InsertError::UNKNOWN};
+
+        if (!checkUniqueConstraints(row, std::nullopt)) {
+            return {false, InsertError::DUPLICATE_KEY};
+        }
+
+        uint64_t row_id = metadata_.row_count++;
+        storage_.insert_string(row_id, serializeRow(row));
+        insertIntoUniqueIndexes(row, row_id);
+        temporal_->logInsert(row_id, serializeRow(row));
+        saveMetadata();
+        return {true, InsertError::OK};
     }
 
-    if (!checkUniqueConstraints(row, std::nullopt)) {
-        return {false, InsertError::DUPLICATE_KEY};
-    }
+    std::pair<bool, InsertError> insertRow(const Row& input_row,
+                                           const std::vector<bool>& explicit_columns) {
+        auto row_opt = normalizeRow(input_row, explicit_columns);
+        if (!row_opt.has_value()) {
+            return {false, InsertError::UNKNOWN};
+        }
 
-    uint64_t row_id = metadata_.row_count++;
-    storage_.insert_string(row_id, serializeRow(row));
-    insertIntoUniqueIndexes(row, row_id);
-    temporal_->logInsert(row_id, serializeRow(row));
-    saveMetadata();
-    return {true, InsertError::OK};
-}
+        const Row& row = *row_opt;
+        if (!validateRowTypesAndConstraints(row)) {
+            for (size_t i = 0; i < row.size(); ++i) {
+                if (metadata_.columns[i].constraint == ColumnConstraint::NOT_NULL &&
+                    std::holds_alternative<std::nullptr_t>(row[i])) {
+                    return {false, InsertError::NOT_NULL_VIOLATION};
+                }
+                if (!isValueCompatibleWithColumn(row[i], metadata_.columns[i])) {
+                    return {false, InsertError::TYPE_MISMATCH};
+                }
+            }
+            return {false, InsertError::UNKNOWN};
+        }
+
+        if (!checkUniqueConstraints(row, std::nullopt)) {
+            return {false, InsertError::DUPLICATE_KEY};
+        }
+
+        uint64_t row_id = metadata_.row_count++;
+        storage_.insert_string(row_id, serializeRow(row));
+        insertIntoUniqueIndexes(row, row_id);
+        temporal_->logInsert(row_id, serializeRow(row));
+        saveMetadata();
+        return {true, InsertError::OK};
+    }
 
     std::vector<Row> selectRows(const Expr* condition = nullptr) {
         std::vector<Row> result;
@@ -146,7 +151,6 @@ std::pair<bool, InsertError> insertRow(const Row& input_row,
 
         return result;
     }
-
 
     size_t deleteRows(const Expr* condition = nullptr) {
         size_t deleted = 0;
@@ -226,6 +230,11 @@ std::pair<bool, InsertError> insertRow(const Row& input_row,
     }
 
     void saveMetadata() {
+        uint64_t root_id = 0, leaf_head_id = 0;
+        storage_.save_metadata(root_id, leaf_head_id);
+        metadata_.root_page_id = root_id;
+        metadata_.leaf_head_page_id = leaf_head_id;
+
         std::string meta_path = page_manager_->getFilePath() + ".meta";
         std::ofstream meta_file(meta_path, std::ios::binary);
         if (!meta_file.is_open()) {
@@ -276,10 +285,8 @@ std::pair<bool, InsertError> insertRow(const Row& input_row,
             }
         };
 
-        // table name
         writeString(metadata_.name);
 
-        // columns
         size_t col_count = metadata_.columns.size();
         writePod(col_count);
         for (const auto& col : metadata_.columns) {
@@ -296,8 +303,9 @@ std::pair<bool, InsertError> insertRow(const Row& input_row,
             }
         }
 
-        // row count
         writePod(metadata_.row_count);
+        writePod(metadata_.root_page_id);
+        writePod(metadata_.leaf_head_page_id);
         meta_file.close();
     }
 
@@ -373,40 +381,44 @@ std::pair<bool, InsertError> insertRow(const Row& input_row,
         }
 
         readPod(metadata.row_count);
+
+        if (meta_file.peek() != EOF) {
+            readPod(metadata.root_page_id);
+            if (meta_file.peek() != EOF) {
+                readPod(metadata.leaf_head_page_id);
+            }
+        }
+
         meta_file.close();
         return metadata;
     }
 
     bool revertTo(const std::chrono::system_clock::time_point& tp) {
-    return temporal_->revertTo(tp, [this](const LogRecord& undo) -> bool {
-        switch (undo.type) {
-            case LogOpType::INSERT: {
-                auto row = deserializeRow(undo.new_data);
-                uint64_t rid = undo.row_id;
-                // Восстанавливаем удалённую вставку – заново вставляем строку
-                storage_.insert_string(rid, serializeRow(row));
-                insertIntoUniqueIndexes(row, rid);
-                if (rid >= metadata_.row_count) metadata_.row_count = rid + 1;
-                break;
+        return temporal_->revertTo(tp, [this](const LogRecord& undo) -> bool {
+            switch (undo.type) {
+                case LogOpType::INSERT: {
+                    auto row = deserializeRow(undo.new_data);
+                    uint64_t rid = undo.row_id;
+                    storage_.insert_string(rid, serializeRow(row));
+                    insertIntoUniqueIndexes(row, rid);
+                    if (rid >= metadata_.row_count) metadata_.row_count = rid + 1;
+                    break;
+                }
+                case LogOpType::DELETE: {
+                    storage_.remove(undo.row_id);
+                    break;
+                }
+                case LogOpType::UPDATE: {
+                    storage_.insert_string(undo.row_id, undo.new_data);
+                    break;
+                }
             }
-            case LogOpType::DELETE: {
-                // Отмена удаления – удаляем строку (она была удалена в логе)
-                storage_.remove(undo.row_id);
-                break;
-            }
-            case LogOpType::UPDATE: {
-                // Отмена обновления – записываем старые данные
-                storage_.insert_string(undo.row_id, undo.new_data);
-                break;
-            }
-        }
-        saveMetadata();
-        return true;
-    });
-}
+            saveMetadata();
+            return true;
+        });
+    }
 
 private:
-
     void initIndexedColumns() {
         for (size_t i = 0; i < metadata_.columns.size(); ++i) {
             if (metadata_.columns[i].constraint == ColumnConstraint::INDEXED) {
@@ -508,7 +520,6 @@ private:
             return std::holds_alternative<std::string>(v);
         }
 
-        // Если тип неизвестен — не ломаем существующий код, но и NULL не пропускаем.
         return !std::holds_alternative<std::nullptr_t>(v);
     }
 
@@ -779,8 +790,6 @@ private:
     }
 };
 
-// ==================== Database Implementation ====================
-
 class Database {
 public:
     Database(const std::string& root_path, const std::string& name)
@@ -822,7 +831,6 @@ public:
         auto table = std::make_shared<Table>(db_path_, meta);
         tables_[meta.name] = table;
         
-        // Обновляем метаданные базы данных
         metadata_.updated_at = getCurrentTimestamp();
         saveDatabaseMetadata();
         return true;
@@ -846,7 +854,6 @@ public:
             fs::remove(meta_file);
         }
         
-        // Обновляем метаданные базы данных
         metadata_.updated_at = getCurrentTimestamp();
         saveDatabaseMetadata();
         return true;
@@ -886,7 +893,6 @@ private:
     std::string getCurrentTimestamp() {
         auto now = std::time(nullptr);
         std::string timestamp = std::ctime(&now);
-        // Убираем символ новой строки в конце
         if (!timestamp.empty() && timestamp.back() == '\n') {
             timestamp.pop_back();
         }
@@ -913,35 +919,25 @@ private:
             }
         };
 
-        // Сигнатура файла для проверки формата
         const char signature[4] = {'D', 'B', 'M', 'T'};
         meta_file.write(signature, 4);
         
-        // Версия формата
         uint32_t format_version = 1;
         writePod(format_version);
         
-        // Версия базы данных
         writeString(metadata_.version);
-        
-        // Имя базы данных
         writeString(name_);
-        
-        // Временные метки
         writeString(metadata_.created_at);
         writeString(metadata_.updated_at);
         
-        // Количество таблиц
         size_t table_count = tables_.size();
         writePod(table_count);
         
-        // Информация о таблицах
         for (const auto& [table_name, table] : tables_) {
             writeString(table_name);
             writePod(table->metadata().row_count);
             writePod(table->metadata().columns.size());
             
-            // Сохраняем информацию о колонках для быстрой загрузки
             for (const auto& col : table->metadata().columns) {
                 writeString(col.name);
                 writeString(col.type);
@@ -975,7 +971,6 @@ private:
             return s;
         };
 
-        // Проверяем сигнатуру
         char signature[4];
         meta_file.read(signature, 4);
         if (signature[0] != 'D' || signature[1] != 'B' || 
@@ -984,7 +979,6 @@ private:
             return false;
         }
         
-        // Версия формата
         uint32_t format_version = 0;
         readPod(format_version);
         if (format_version != 1) {
@@ -992,34 +986,28 @@ private:
             return false;
         }
         
-        // Версия базы данных
         metadata_.version = readString();
         
-        // Имя базы данных (сверяем с текущим)
         std::string stored_name = readString();
         if (stored_name != name_) {
             std::cerr << "Warning: Database name mismatch in metadata" << std::endl;
         }
         
-        // Временные метки
         metadata_.created_at = readString();
         metadata_.updated_at = readString();
         
-        // Количество таблиц (просто считываем, но не используем - таблицы загрузятся отдельно)
         size_t table_count = 0;
         readPod(table_count);
         
-        // Пропускаем детальную информацию о таблицах, 
-        // так как таблицы загрузятся из своих собственных метафайлов
         for (size_t i = 0; i < table_count; ++i) {
-            readString(); // table_name
+            readString();
             uint64_t dummy_row_count = 0;
             readPod(dummy_row_count);
             size_t dummy_col_count = 0;
             readPod(dummy_col_count);
             for (size_t j = 0; j < dummy_col_count; ++j) {
-                readString(); // col_name
-                readString(); // col_type
+                readString();
+                readString();
                 uint8_t dummy_constraint = 0;
                 readPod(dummy_constraint);
             }
@@ -1027,7 +1015,6 @@ private:
 
         meta_file.close();
         
-        // Загружаем таблицы
         loadTables();
         
         return true;
@@ -1036,7 +1023,6 @@ private:
     void loadTables() {
         for (const auto& entry : fs::directory_iterator(db_path_)) {
             if (entry.path().extension() == ".meta") {
-                // Пропускаем метафайл самой базы данных
                 if (entry.path().filename() == "database.meta") {
                     continue;
                 }
@@ -1058,8 +1044,6 @@ private:
     std::unordered_map<std::string, std::shared_ptr<Table>> tables_;
     DatabaseMetadata metadata_;
 };
-
-// ==================== DBMS Implementation ====================
 
 class DBMS {
 public:
@@ -1105,7 +1089,6 @@ public:
             return false;
         }
 
-        // Если удаляем текущую БД, сбрасываем указатель
         if (current_db_ && current_db_->name() == name) {
             current_db_.reset();
         }
@@ -1129,7 +1112,6 @@ public:
         }
         current_db_ = it->second;
         
-        // Сохраняем текущую БД в метаданных
         if (current_db_) {
             metadata_.current_database = current_db_->name();
         } else {
@@ -1202,33 +1184,23 @@ private:
             }
         };
 
-        // Сигнатура файла для проверки формата
         const char signature[4] = {'D', 'B', 'M', 'S'};
         meta_file.write(signature, 4);
         
-        // Версия формата
         uint32_t format_version = 1;
         writePod(format_version);
         
-        // Версия СУБД
         writeString(metadata_.version);
-        
-        // Временные метки
         writeString(metadata_.created_at);
         writeString(metadata_.updated_at);
-        
-        // Корневая директория
         writeString(root_dir_);
         
-        // Текущая база данных
         std::string current_db = current_db_ ? current_db_->name() : "";
         writeString(current_db);
         
-        // Количество баз данных
         size_t db_count = databases_.size();
         writePod(db_count);
         
-        // Информация о базах данных
         for (const auto& [db_name, db] : databases_) {
             writeString(db_name);
             writeString(db->getCreatedAt());
@@ -1260,7 +1232,6 @@ private:
             return s;
         };
 
-        // Проверяем сигнатуру
         char signature[4];
         meta_file.read(signature, 4);
         if (signature[0] != 'D' || signature[1] != 'B' || 
@@ -1269,7 +1240,6 @@ private:
             return false;
         }
         
-        // Версия формата
         uint32_t format_version = 0;
         readPod(format_version);
         if (format_version != 1) {
@@ -1277,37 +1247,29 @@ private:
             return false;
         }
         
-        // Версия СУБД
         metadata_.version = readString();
-        
-        // Временные метки
         metadata_.created_at = readString();
         metadata_.updated_at = readString();
         
-        // Корневая директория (сверяем)
         std::string stored_root = readString();
         if (stored_root != root_dir_) {
             std::cerr << "Warning: Root directory mismatch in metadata" << std::endl;
         }
         
-        // Текущая база данных
         metadata_.current_database = readString();
         
-        // Количество баз данных (пропускаем, базы загрузятся отдельно)
         size_t db_count = 0;
         readPod(db_count);
         for (size_t i = 0; i < db_count; ++i) {
-            readString(); // db_name
-            readString(); // created_at
-            readString(); // updated_at
+            readString();
+            readString();
+            readString();
         }
 
         meta_file.close();
         
-        // Загружаем базы данных
         loadDatabases();
         
-        // Восстанавливаем текущую базу данных
         if (!metadata_.current_database.empty()) {
             auto it = databases_.find(metadata_.current_database);
             if (it != databases_.end()) {
@@ -1334,8 +1296,6 @@ private:
     DBMSMetadata metadata_;
 };
 
-// ==================== SQL Executor ====================
-
 class SQLExecutor {
 public:
     explicit SQLExecutor(DBMS& dbms) : dbms_(dbms) {}
@@ -1354,7 +1314,7 @@ private:
         if (stmt.table.database.empty())
             db = dbms_.currentDatabase();
         else
-            db = dbms_.getDatabase(stmt.table.database);   // добавьте метод getDatabase в DBMS (см. ниже)
+            db = dbms_.getDatabase(stmt.table.database);
         if (!db) throw std::runtime_error("Database not found");
         auto table = db->getTable(stmt.table.name);
         if (!table) throw std::runtime_error("Table not found");
@@ -1406,62 +1366,62 @@ private:
         std::cout << "Table dropped\n";
     }
 
-void executeStatement(const InsertStmt& stmt) {
-    auto db = dbms_.currentDatabase();
-    if (!db) {
-        throw std::runtime_error("No database selected");
-        return;
-    }
-
-    auto table = db->getTable(stmt.table.name);
-    if (!table) {
-        throw std::runtime_error("Table not found");
-        return;
-    }
-
-    const auto& columns = table->metadata().columns;
-    size_t inserted = 0;
-
-    for (size_t i = 0; i < stmt.values.size(); ++i) {
-        Row fullRow(columns.size(), nullptr);
-        std::vector<bool> explicit_flags(columns.size(), false);
-
-        for (size_t j = 0; j < stmt.columns.size(); ++j) {
-            const std::string& colName = stmt.columns[j];
-            auto it = std::find_if(columns.begin(), columns.end(),
-                [&](const ColumnDef& c) { return c.name == colName; });
-            if (it == columns.end()) {
-                std::cout << "Error: Column " << colName << " not found\n";
-                return;
-            }
-            size_t colIdx = std::distance(columns.begin(), it);
-            fullRow[colIdx] = stmt.values[i][j];
-            explicit_flags[colIdx] = true; 
+    void executeStatement(const InsertStmt& stmt) {
+        auto db = dbms_.currentDatabase();
+        if (!db) {
+            throw std::runtime_error("No database selected");
+            return;
         }
 
-        auto [ok, error] = table->insertRow(fullRow, explicit_flags);
-        if (!ok) {
-            std::string msg;
-            switch (error) {
-                case Table::InsertError::DUPLICATE_KEY:
-                    msg = "Duplicate key value at row " + std::to_string(i + 1);
-                    break;
-                case Table::InsertError::NOT_NULL_VIOLATION:
-                    msg = "NOT NULL constraint failed at row " + std::to_string(i + 1);
-                    break;
-                case Table::InsertError::TYPE_MISMATCH:
-                    msg = "Type mismatch at row " + std::to_string(i + 1);
-                    break;
-                default:
-                    msg = "Insert failed at row " + std::to_string(i + 1);
-            }
-            throw std::runtime_error(msg);
+        auto table = db->getTable(stmt.table.name);
+        if (!table) {
+            throw std::runtime_error("Table not found");
+            return;
         }
-        ++inserted;
-    }
 
-    std::cout << "Inserted " << inserted << " rows\n";
-}
+        const auto& columns = table->metadata().columns;
+        size_t inserted = 0;
+
+        for (size_t i = 0; i < stmt.values.size(); ++i) {
+            Row fullRow(columns.size(), nullptr);
+            std::vector<bool> explicit_flags(columns.size(), false);
+
+            for (size_t j = 0; j < stmt.columns.size(); ++j) {
+                const std::string& colName = stmt.columns[j];
+                auto it = std::find_if(columns.begin(), columns.end(),
+                    [&](const ColumnDef& c) { return c.name == colName; });
+                if (it == columns.end()) {
+                    std::cout << "Error: Column " << colName << " not found\n";
+                    return;
+                }
+                size_t colIdx = std::distance(columns.begin(), it);
+                fullRow[colIdx] = stmt.values[i][j];
+                explicit_flags[colIdx] = true; 
+            }
+
+            auto [ok, error] = table->insertRow(fullRow, explicit_flags);
+            if (!ok) {
+                std::string msg;
+                switch (error) {
+                    case Table::InsertError::DUPLICATE_KEY:
+                        msg = "Duplicate key value at row " + std::to_string(i + 1);
+                        break;
+                    case Table::InsertError::NOT_NULL_VIOLATION:
+                        msg = "NOT NULL constraint failed at row " + std::to_string(i + 1);
+                        break;
+                    case Table::InsertError::TYPE_MISMATCH:
+                        msg = "Type mismatch at row " + std::to_string(i + 1);
+                        break;
+                    default:
+                        msg = "Insert failed at row " + std::to_string(i + 1);
+                }
+                throw std::runtime_error(msg);
+            }
+            ++inserted;
+        }
+
+        std::cout << "Inserted " << inserted << " rows\n";
+    }
 
     void executeStatement(const SelectStmt& stmt) {
         auto db = dbms_.currentDatabase();
