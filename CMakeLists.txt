@@ -40,7 +40,10 @@ file(GLOB_RECURSE COMMON_SOURCES
     "project/common/src/*.cpp"
 )
 
-list(REMOVE_ITEM COMMON_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/project/common/src/Json.cpp")
+if(NOT "${CMAKE_CURRENT_SOURCE_DIR}/project/common/src/Json.cpp" IN_LIST COMMON_SOURCES)
+    list(APPEND COMMON_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/project/common/src/Json.cpp")
+endif()
+
 
 file(GLOB_RECURSE TEXT_HANDLER_SOURCES 
     "project/client/Text\ handler/src/*.cpp"

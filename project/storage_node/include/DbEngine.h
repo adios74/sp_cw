@@ -9,21 +9,20 @@
 #include <fstream>
 #include <iostream>
 #include <optional>
-#include <chrono>
-#include <functional>
 
-#include "../../common/include/AST.h"
-#include "../../common/include/Parser.h"
 #include "Temporal.h"
 #include "StringPool.h"
 #include "types.h"
+
+#include "../../common/include/AST.h"
+#include "../../common/include/Json.h"
+#include "../../common/include/Parser.h"
 #include "../../common/include/Json.h"
 
 #include "StorageNode.h"
+using Row = std::vector<Value>;
 
 namespace fs = std::filesystem;
-
-using Row = std::vector<Value>;
 
 struct TableMetadata {
     std::string name;
@@ -36,22 +35,25 @@ private:
     TableMetadata metadata_;
     std::unique_ptr<PageManager> page_manager_;
     PageBasedIndex<uint64_t> storage_;
-    std::unordered_map<size_t, std::unique_ptr<PageBasedIndex<std::string>>> unique_indexes_;
     std::unique_ptr<TemporalManager> temporal_;
 
-public:
+    // Уникальные индексы для колонок с constraint == INDEXED
+    std::unordered_map<size_t, std::unique_ptr<PageBasedIndex<std::string>>> unique_indexes_;
 
+public:
     Table(const std::string& db_path, const TableMetadata& metadata)
         : metadata_(metadata),
           page_manager_(std::make_unique<PageManager>(db_path + "/" + metadata.name + ".tbl")),
           storage_(*page_manager_),
-          temporal_(std::make_unique<TemporalManager>(db_path + "/" + metadata.name + ".log")) {
+          temporal_(std::make_unique<TemporalManager>(db_path + "/" + metadata.name + ".log"))  {
         initIndexedColumns();
         rebuildIndexesFromStorage();
         saveMetadata();
     }
 
-    const TableMetadata& metadata() const { return metadata_; }
+    const TableMetadata& metadata() const { 
+        return metadata_; 
+    }
 
 enum class InsertError {
     OK,
@@ -86,11 +88,10 @@ std::pair<bool, InsertError> insertRow(const Row& input_row) {
         return {false, InsertError::DUPLICATE_KEY};
     }
 
-    std::string serialized = serializeRow(row);
     uint64_t row_id = metadata_.row_count++;
     storage_.insert_string(row_id, serializeRow(row));
     insertIntoUniqueIndexes(row, row_id);
-    temporal_->logInsert(row_id, serialized);
+    temporal_->logInsert(row_id, serializeRow(row));
     saveMetadata();
     return {true, InsertError::OK};
 }
@@ -120,12 +121,10 @@ std::pair<bool, InsertError> insertRow(const Row& input_row,
         return {false, InsertError::DUPLICATE_KEY};
     }
 
-  
-    std::string serialized = serializeRow(row);
     uint64_t row_id = metadata_.row_count++;
     storage_.insert_string(row_id, serializeRow(row));
     insertIntoUniqueIndexes(row, row_id);
-    temporal_->logInsert(row_id, serialized);
+    temporal_->logInsert(row_id, serializeRow(row));
     saveMetadata();
     return {true, InsertError::OK};
 }
@@ -160,8 +159,8 @@ std::pair<bool, InsertError> insertRow(const Row& input_row,
 
             Row row = deserializeRow(*rowData);
             if (!condition || evaluateCondition(condition, row)) {
-                temporal_->logDelete(i, *rowData);
                 removeFromUniqueIndexes(row);
+                temporal_->logDelete(i, *rowData);
                 storage_.remove(i);
                 ++deleted;
             }
@@ -215,38 +214,15 @@ std::pair<bool, InsertError> insertRow(const Row& input_row,
                 continue;
             }
 
+            removeFromUniqueIndexes(row);
             std::string newSerialized = serializeRow(new_row);
             temporal_->logUpdate(i, *rowData, newSerialized);
-            removeFromUniqueIndexes(row);
             storage_.insert_string(i, serializeRow(new_row));
             insertIntoUniqueIndexes(new_row, i);
             ++updated;
         }
 
         return updated;
-    }
-
-    bool revertTo(const std::chrono::system_clock::time_point& tp) {
-        return temporal_->revertTo(tp, [this](const LogRecord& undo) -> bool {
-            switch (undo.type) {
-                case LogOpType::INSERT: {
-                    auto row = deserializeRow(undo.new_data);
-                    uint64_t rid = undo.row_id;
-                    storage_.insert_string(rid, serializeRow(row));
-                    insertIntoUniqueIndexes(row, rid);
-                    if (rid >= metadata_.row_count) metadata_.row_count = rid + 1;
-                    break;
-                }
-                case LogOpType::DELETE:
-                    storage_.remove(undo.row_id);
-                    break;
-                case LogOpType::UPDATE:
-                    storage_.insert_string(undo.row_id, undo.new_data);
-                    break;
-            }
-            saveMetadata();
-            return true;
-        });
     }
 
     void saveMetadata() {
@@ -400,6 +376,34 @@ std::pair<bool, InsertError> insertRow(const Row& input_row,
         meta_file.close();
         return metadata;
     }
+
+    bool revertTo(const std::chrono::system_clock::time_point& tp) {
+    return temporal_->revertTo(tp, [this](const LogRecord& undo) -> bool {
+        switch (undo.type) {
+            case LogOpType::INSERT: {
+                auto row = deserializeRow(undo.new_data);
+                uint64_t rid = undo.row_id;
+                // Восстанавливаем удалённую вставку – заново вставляем строку
+                storage_.insert_string(rid, serializeRow(row));
+                insertIntoUniqueIndexes(row, rid);
+                if (rid >= metadata_.row_count) metadata_.row_count = rid + 1;
+                break;
+            }
+            case LogOpType::DELETE: {
+                // Отмена удаления – удаляем строку (она была удалена в логе)
+                storage_.remove(undo.row_id);
+                break;
+            }
+            case LogOpType::UPDATE: {
+                // Отмена обновления – записываем старые данные
+                storage_.insert_string(undo.row_id, undo.new_data);
+                break;
+            }
+        }
+        saveMetadata();
+        return true;
+    });
+}
 
 private:
 
@@ -599,173 +603,84 @@ private:
 
     int getColumnIndex(const std::string& column) const {
         for (size_t i = 0; i < metadata_.columns.size(); ++i) {
-            if (metadata_.columns[i].constraint == ColumnConstraint::INDEXED) {
-                unique_indexes_[i] = std::make_unique<PageBasedIndex<std::string>>(*page_manager_);
+            if (metadata_.columns[i].name == column) {
+                return static_cast<int>(i);
             }
         }
-    }
-
-    void rebuildIndexesFromStorage() {
-        for (auto& [idx, idx_ptr] : unique_indexes_) idx_ptr->clear();
-        for (uint64_t rid = 0; rid < metadata_.row_count; ++rid) {
-            auto data = storage_.find_string(rid);
-            if (!data) continue;
-            auto row = deserializeRow(*data);
-            for (const auto& [col_idx, idx_ptr] : unique_indexes_) {
-                if (col_idx >= row.size()) continue;
-                const DBValue& v = row[col_idx];
-                if (v.is_null) continue;
-                std::string key = indexKey(v);
-                if (idx_ptr->contains(key))
-                    throw std::runtime_error("Duplicate value rebuilding INDEXED in " + metadata_.name);
-                idx_ptr->insert_string(key, std::to_string(rid));
-            }
-        }
-    }
-
-    std::optional<std::vector<DBValue>> normalizeRow(const std::vector<DBValue>& input_row) const {
-        if (input_row.size() > metadata_.columns.size()) return std::nullopt;
-        auto row = input_row;
-        row.resize(metadata_.columns.size(), DBValue::null_of(DataType::INT));
-        // DEFAULT values temporarily disabled
-        // for (size_t i = 0; i < metadata_.columns.size(); ++i) {
-        //     if (i >= input_row.size() || row[i].is_null) {
-        //         if (metadata_.columns[i].default_value.has_value()) {
-        //             row[i] = astToDBValue(*metadata_.columns[i].default_value);
-        //         }
-        //     }
-        // }
-        return row;
-    }
-
-    bool isNullable(const ColumnDef& col) const {
-        return !(col.constraint == ColumnConstraint::NOT_NULL || col.constraint == ColumnConstraint::INDEXED);
-    }
-
-    bool isIntType(const std::string& t) const {
-        std::string u = upper(t);
-        return u == "INT" || u == "INTEGER";
-    }
-    bool isStringType(const std::string& t) const {
-        std::string u = upper(t);
-        return u == "STRING" || u == "TEXT" || u == "VARCHAR";
-    }
-    std::string upper(std::string s) const {
-        for (char& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-        return s;
-    }
-
-    bool isValueCompatibleWithColumn(const DBValue& v, const ColumnDef& col) const {
-        if (v.is_null) return isNullable(col);
-        if (isIntType(col.type)) return v.type == DataType::INT;
-        if (isStringType(col.type)) return v.type == DataType::STRING;
-        return !v.is_null;
-    }
-
-    bool validateRowTypesAndConstraints(const std::vector<DBValue>& row) const {
-        if (row.size() != metadata_.columns.size()) return false;
-        for (size_t i = 0; i < row.size(); ++i) {
-            if (!isValueCompatibleWithColumn(row[i], metadata_.columns[i])) return false;
-            if (metadata_.columns[i].constraint == ColumnConstraint::INDEXED && row[i].is_null) return false;
-        }
-        return true;
-    }
-
-    std::string indexKey(const DBValue& v) const {
-        if (v.type == DataType::INT) return "INT:" + std::to_string(v.ival);
-        if (v.type == DataType::STRING) return "STR:" + v.getString();
-        throw std::runtime_error("INDEXED column cannot be NULL");
-    }
-
-    bool checkUniqueConstraints(const std::vector<DBValue>& row, std::optional<uint64_t> current_rid) const {
-        for (const auto& [col_idx, idx_ptr] : unique_indexes_) {
-            if (col_idx >= row.size()) continue;
-            const DBValue& v = row[col_idx];
-            if (v.is_null) return false;
-            std::string key = indexKey(v);
-            auto existing = idx_ptr->find_string(key);
-            if (!existing) continue;
-            uint64_t existing_rid = std::stoull(*existing);
-            if (!current_rid || existing_rid != *current_rid) return false;
-        }
-        return true;
-    }
-
-    void insertIntoUniqueIndexes(const std::vector<DBValue>& row, uint64_t rid) {
-        for (const auto& [col_idx, idx_ptr] : unique_indexes_) {
-            if (col_idx >= row.size()) continue;
-            const DBValue& v = row[col_idx];
-            if (v.is_null) continue;
-            idx_ptr->insert_string(indexKey(v), std::to_string(rid));
-        }
-    }
-
-    void removeFromUniqueIndexes(const std::vector<DBValue>& row) {
-        for (const auto& [col_idx, idx_ptr] : unique_indexes_) {
-            if (col_idx >= row.size()) continue;
-            const DBValue& v = row[col_idx];
-            if (v.is_null) continue;
-            idx_ptr->remove(indexKey(v));
-        }
-    }
-
-    int getColumnIndex(const std::string& name) const {
-        for (size_t i = 0; i < metadata_.columns.size(); ++i)
-            if (metadata_.columns[i].name == name) return static_cast<int>(i);
         return -1;
     }
 
-    std::string serializeValue(const DBValue& v) const {
-        if (v.is_null) return "NULL";
-        if (v.type == DataType::INT) return "INT:" + std::to_string(v.ival);
-        return "STR:" + v.getString();
+    std::string serializeValue(const Value& value) {
+        if (std::holds_alternative<int>(value)) {
+            return "INT:" + std::to_string(std::get<int>(value));
+        }
+        if (std::holds_alternative<std::string>(value)) {
+            return "STR:" + std::get<std::string>(value);
+        }
+        if (std::holds_alternative<std::nullptr_t>(value)) {
+            return "NULL";
+        }
+        return "UNKNOWN";
     }
 
-    DBValue deserializeValue(const std::string& s) const {
-        if (s == "NULL") return DBValue::null_of(DataType::INT);
-        if (s.starts_with("INT:")) return DBValue::of_int(std::stoi(s.substr(4)));
-        if (s.starts_with("STR:")) return DBValue::of_str(s.substr(4));
-        return DBValue::null_of(DataType::INT);
+    Value deserializeValue(const std::string& str) {
+        if (str.starts_with("INT:")) {
+            return std::stoi(str.substr(4));
+        }
+        if (str.starts_with("STR:")) {
+            return str.substr(4);
+        }
+        return nullptr;
     }
 
-    std::string serializeRow(const std::vector<DBValue>& row) const {
+    std::string serializeRow(const Row& row) {
         std::string result;
         for (size_t i = 0; i < row.size(); ++i) {
             result += serializeValue(row[i]);
-            if (i+1 < row.size()) result += "|";
+            if (i + 1 < row.size()) {
+                result += "|";
+            }
         }
         return result;
     }
 
-    std::vector<DBValue> deserializeRow(const std::string& data) const {
-        std::vector<DBValue> row;
-        std::string cur;
+    Row deserializeRow(const std::string& data) {
+        Row row;
+        std::string current;
+        
         for (char c : data) {
             if (c == '|') {
-                row.push_back(deserializeValue(cur));
-                cur.clear();
-            } else cur += c;
+                row.push_back(deserializeValue(current));
+                current.clear();
+            } else {
+                current += c;
+            }
         }
-        if (!cur.empty()) row.push_back(deserializeValue(cur));
+        
+        if (!current.empty()) {
+            row.push_back(deserializeValue(current));
+        }
+        
         return row;
     }
 
-    bool compareValues(const DBValue& left, const DBValue& right, ComparisonOp op) const {
-        if (left.is_null || right.is_null) return false;
-        if (left.type != right.type) return false;
-        if (left.type == DataType::INT) {
-            int l = left.ival, r = right.ival;
-            switch (op) {
-                case ComparisonOp::EQUAL: return l == r;
-                case ComparisonOp::NOT_EQUAL: return l != r;
-                case ComparisonOp::LESS: return l < r;
-                case ComparisonOp::GREATER: return l > r;
-                case ComparisonOp::LESS_OR_EQUAL: return l <= r;
-                case ComparisonOp::GREATER_OR_EQUAL: return l >= r;
+    Value resolveValue(const Value& val, const Row& row) {
+        if (std::holds_alternative<ColumnRef>(val)) {
+            ColumnRef ref = std::get<ColumnRef>(val);
+            int idx = getColumnIndex(ref.column);
+            if (idx >= 0 && idx < static_cast<int>(row.size())) {
+                return row[idx];
             }
-        } else {
-            const std::string& l = left.getString();
-            const std::string& r = right.getString();
+            return nullptr;
+        }
+        return val;
+    }
+
+    bool compareValues(const Value& left, const Value& right, ComparisonOp op) {
+        if (std::holds_alternative<int>(left) && std::holds_alternative<int>(right)) {
+            int l = std::get<int>(left);
+            int r = std::get<int>(right);
+            
             switch (op) {
                 case ComparisonOp::EQUAL: return l == r;
                 case ComparisonOp::NOT_EQUAL: return l != r;
@@ -775,31 +690,61 @@ private:
                 case ComparisonOp::GREATER_OR_EQUAL: return l >= r;
             }
         }
+        
+        if (std::holds_alternative<std::string>(left) && std::holds_alternative<std::string>(right)) {
+            std::string l = std::get<std::string>(left);
+            std::string r = std::get<std::string>(right);
+            
+            switch (op) {
+                case ComparisonOp::EQUAL: return l == r;
+                case ComparisonOp::NOT_EQUAL: return l != r;
+                case ComparisonOp::LESS: return l < r;
+                case ComparisonOp::GREATER: return l > r;
+                case ComparisonOp::LESS_OR_EQUAL: return l <= r;
+                case ComparisonOp::GREATER_OR_EQUAL: return l >= r;
+            }
+        }
+        
         return false;
     }
 
-    bool evaluateCondition(const Expr* expr, const std::vector<DBValue>& row) const {
+    bool evaluateCondition(const Expr* expr, const Row& row) {
         if (!expr) return true;
+        
         switch (expr->type) {
             case Expr::COMPARISON: {
-                DBValue left = astToDBValue(expr->comparison.left);
-                DBValue right = astToDBValue(expr->comparison.right);
+                Value left = resolveValue(expr->comparison.left, row);
+                Value right = resolveValue(expr->comparison.right, row);
                 return compareValues(left, right, expr->comparison.op);
             }
+            
             case Expr::AND:
-                return evaluateCondition(expr->left.get(), row) && evaluateCondition(expr->right.get(), row);
+                return evaluateCondition(expr->left.get(), row) &&
+                       evaluateCondition(expr->right.get(), row);
+            
             case Expr::OR:
-                return evaluateCondition(expr->left.get(), row) || evaluateCondition(expr->right.get(), row);
+                return evaluateCondition(expr->left.get(), row) ||
+                       evaluateCondition(expr->right.get(), row);
+            
             case Expr::NOT:
                 return !evaluateCondition(expr->left.get(), row);
+            
             case Expr::BETWEEN: {
-                DBValue val = astToDBValue(expr->between.val);
-                DBValue start = astToDBValue(expr->between.start);
-                DBValue end = astToDBValue(expr->between.end);
-                if (val.type == DataType::INT && start.type == DataType::INT && end.type == DataType::INT)
-                    return val.ival >= start.ival && val.ival <= end.ival;
+                Value val = resolveValue(expr->between.val, row);
+                Value start = resolveValue(expr->between.start, row);
+                Value end = resolveValue(expr->between.end, row);
+                
+                if (std::holds_alternative<int>(val) && 
+                    std::holds_alternative<int>(start) && 
+                    std::holds_alternative<int>(end)) {
+                    int v = std::get<int>(val);
+                    int s = std::get<int>(start);
+                    int e = std::get<int>(end);
+                    return v >= s && v <= e;
+                }
                 return false;
             }
+            
             case Expr::LIKE: {
                 Value val = resolveValue(expr->like.val, row);
                 Value pattern = resolveValue(expr->like.pattern, row);
@@ -829,17 +774,19 @@ private:
                 return false;
             }
         }
+        
         return false;
     }
 };
 
-// ==================== Database ====================
+// ==================== Database Implementation ====================
 
 class Database {
 public:
     Database(const std::string& root_path, const std::string& name)
         : root_path_(root_path), name_(name) {
         db_path_ = root_path_ + "/" + name_;
+        
         if (!fs::exists(db_path_)) {
             fs::create_directories(db_path_);
             metadata_.created_at = getCurrentTimestamp();
@@ -854,22 +801,24 @@ public:
             }
         }
     }
-    ~Database() { flush(); }
+    
+    ~Database() {
+        flush();
+    }
 
-    const std::string& name() const { return name_; }
+    const std::string& name() const {
+        return name_;
+    }
 
     bool createTable(const CreateTableStmt& stmt) {
-        if (tables_.contains(stmt.table.name)) return false;
+        if (tables_.contains(stmt.table.name)) {
+            return false;
+        }
+
         TableMetadata meta;
         meta.name = stmt.table.name;
-        for (const auto& colDef : stmt.columns) {
-            ColumnDef col;
-            col.name = colDef.name;
-            col.type = colDef.type;
-            col.constraint = colDef.constraint;
-            // default values not supported yet
-            meta.columns.push_back(col);
-        }
+        meta.columns = stmt.columns;
+
         auto table = std::make_shared<Table>(db_path_, meta);
         tables_[meta.name] = table;
         
@@ -881,14 +830,23 @@ public:
 
     bool dropTable(const std::string& table_name) {
         auto it = tables_.find(table_name);
-        if (it == tables_.end()) return false;
+        if (it == tables_.end()) {
+            return false;
+        }
+
         tables_.erase(it);
+        
         std::string file = db_path_ + "/" + table_name + ".tbl";
         std::string meta_file = file + ".meta";
-        std::string log_file = db_path_ + "/" + table_name + ".log";
-        if (fs::exists(file)) fs::remove(file);
-        if (fs::exists(meta_file)) fs::remove(meta_file);
-        if (fs::exists(log_file)) fs::remove(log_file);
+        
+        if (fs::exists(file)) {
+            fs::remove(file);
+        }
+        if (fs::exists(meta_file)) {
+            fs::remove(meta_file);
+        }
+        
+        // Обновляем метаданные базы данных
         metadata_.updated_at = getCurrentTimestamp();
         saveDatabaseMetadata();
         return true;
@@ -896,7 +854,10 @@ public:
 
     std::shared_ptr<Table> getTable(const std::string& name) {
         auto it = tables_.find(name);
-        return it == tables_.end() ? nullptr : it->second;
+        if (it == tables_.end()) {
+            return nullptr;
+        }
+        return it->second;
     }
     
     const std::string& getCreatedAt() const {
@@ -1098,7 +1059,7 @@ private:
     DatabaseMetadata metadata_;
 };
 
-// ==================== DBMS ====================
+// ==================== DBMS Implementation ====================
 
 class DBMS {
 public:
@@ -1119,10 +1080,19 @@ public:
         }
     }
 
-    ~DBMS() { flushAll(); }
+    std::shared_ptr<Database> getDatabase(const std::string& name) const {
+        auto it = databases_.find(name);
+        return it != databases_.end() ? it->second : nullptr;
+    }
+    
+    ~DBMS() {
+        flushAll();
+    }
 
     bool createDatabase(const std::string& name) {
-        if (databases_.contains(name)) return false;
+        if (databases_.contains(name)) {
+            return false;
+        }
         databases_[name] = std::make_shared<Database>(root_dir_, name);
         metadata_.updated_at = getCurrentTimestamp();
         saveDBMSMetadata();
@@ -1154,7 +1124,9 @@ public:
 
     bool useDatabase(const std::string& name) {
         auto it = databases_.find(name);
-        if (it == databases_.end()) return false;
+        if (it == databases_.end()) {
+            return false;
+        }
         current_db_ = it->second;
         
         // Сохраняем текущую БД в метаданных
@@ -1169,9 +1141,8 @@ public:
         return true;
     }
 
-    std::shared_ptr<Database> getDatabase(const std::string& name) const {
-        auto it = databases_.find(name);
-        return it == databases_.end() ? nullptr : it->second;
+    std::shared_ptr<Database> currentDatabase() {
+        return current_db_;
     }
     
     const std::string& getRootDir() const {
@@ -1193,8 +1164,6 @@ public:
         metadata_.updated_at = getCurrentTimestamp();
         saveDBMSMetadata();
     }
-  
-    std::shared_ptr<Database> currentDatabase() const { return current_db_; }
 
 private:
     struct DBMSMetadata {
@@ -1372,27 +1341,47 @@ public:
     explicit SQLExecutor(DBMS& dbms) : dbms_(dbms) {}
 
     void execute(const Statement& stmt) {
-        std::visit([this](auto&& arg) { executeStatement(arg); }, stmt);
+        std::visit([this](auto&& arg) {
+            executeStatement(arg);
+        }, stmt);
     }
 
 private:
     DBMS& dbms_;
+
+    void executeStatement(const RevertStmt& stmt) {
+        std::shared_ptr<Database> db;
+        if (stmt.table.database.empty())
+            db = dbms_.currentDatabase();
+        else
+            db = dbms_.getDatabase(stmt.table.database);   // добавьте метод getDatabase в DBMS (см. ниже)
+        if (!db) throw std::runtime_error("Database not found");
+        auto table = db->getTable(stmt.table.name);
+        if (!table) throw std::runtime_error("Table not found");
+        if (table->revertTo(stmt.timestamp))
+            std::cout << "Table '" << stmt.table.name << "' reverted successfully\n";
+        else
+            throw std::runtime_error("Revert failed");
+    }
 
     void executeStatement(const CreateDatabaseStmt& stmt) {
         bool ok = dbms_.createDatabase(stmt.name);
         if (!ok) throw std::runtime_error("Failed to create database");
         std::cout << "Database created\n";
     }
+
     void executeStatement(const DropDatabaseStmt& stmt) {
         bool ok = dbms_.dropDatabase(stmt.name);
         if (!ok) throw std::runtime_error("Failed to drop database");
         std::cout << "Database dropped\n";
     }
+
     void executeStatement(const UseStmt& stmt) {
         bool ok = dbms_.useDatabase(stmt.name);
         if (!ok) throw std::runtime_error("Database not found");
         std::cout << "Using database\n";
     }
+
     void executeStatement(const CreateTableStmt& stmt) {
         auto db = dbms_.currentDatabase();
         if (!db) {
@@ -1404,6 +1393,7 @@ private:
         if (!ok) throw std::runtime_error("Failed to create table");
         std::cout << "Table created\n";
     }
+
     void executeStatement(const DropTableStmt& stmt) {
         auto db = dbms_.currentDatabase();
         if (!db) {
@@ -1509,36 +1499,24 @@ void executeStatement(const InsertStmt& stmt) {
         if (!table) {
             throw std::runtime_error("Table not found");
         }
+        
         size_t updated = table->updateRows(stmt.assignments, stmt.condition.get());
         std::cout << "Updated " << updated << " rows\n";
     }
 
     void executeStatement(const DeleteStmt& stmt) {
         auto db = dbms_.currentDatabase();
-        if (!db) throw std::runtime_error("No database selected");
-        auto table = db->getTable(stmt.table.name);
-        if (!table) throw std::runtime_error("Table not found");
-        size_t deleted = table->deleteRows(stmt.condition.get());
-        std::cout << "Deleted " << deleted << " rows\n";
-    }
-
-    void executeStatement(const RevertStmt& stmt) {
-        std::shared_ptr<Database> db;
-        if (stmt.table.database.empty())
-            db = dbms_.currentDatabase();
-        else
-            db = dbms_.getDatabase(stmt.table.database);
         if (!db) {
             throw std::runtime_error("No database selected");
         }
+        
         auto table = db->getTable(stmt.table.name);
         if (!table) {
             throw std::runtime_error("Table not found");
         }
-        if (table->revertTo(stmt.timestamp))
-            std::cout << "Table '" << stmt.table.name << "' reverted successfully\n";
-        else
-            std::cout << "Revert failed\n";
+        
+        size_t deleted = table->deleteRows(stmt.condition.get());
+        std::cout << "Deleted " << deleted << " rows\n";
     }
 };
 
