@@ -235,6 +235,8 @@ public:
         metadata_.root_page_id = root_id;
         metadata_.leaf_head_page_id = leaf_head_id;
 
+        page_manager_->flush_all(); 
+        
         std::string meta_path = page_manager_->getFilePath() + ".meta";
         std::ofstream meta_file(meta_path, std::ios::binary);
         if (!meta_file.is_open()) {
