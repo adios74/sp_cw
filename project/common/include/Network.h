@@ -31,6 +31,9 @@ public:
 	int getFd() const { return fd_; }
 	void setFd(int fd) { fd_ = fd; }
 
+	void shutdownWrite();                     // закрывает канал записи
+    void setTimeout(int seconds);
+
 private:
 	int fd_;
 };

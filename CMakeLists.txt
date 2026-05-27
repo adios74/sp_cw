@@ -26,6 +26,7 @@ set(INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/project/common/include
     ${CMAKE_CURRENT_SOURCE_DIR}/project/client
     ${CMAKE_CURRENT_SOURCE_DIR}/project/client/Text\ handler/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/project/entrypoint/include
 )
 
 # ============================================================

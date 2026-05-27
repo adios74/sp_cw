@@ -79,4 +79,20 @@ std::string Socket::recv() {
         if (received < BUFFER_SIZE - 1) break;
     }
     return result;
+    
 }
+
+void Socket::shutdownWrite() {
+    if (fd_ != -1) {
+        ::shutdown(fd_, SHUT_WR);
+    }
+}
+
+void Socket::setTimeout(int seconds) {
+    struct timeval tv;
+    tv.tv_sec = seconds;
+    tv.tv_usec = 0;
+    setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
