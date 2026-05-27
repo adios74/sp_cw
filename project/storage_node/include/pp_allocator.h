@@ -1,7 +1,3 @@
-//
-// Created by Des Caldnd on 6/29/2024.
-//
-
 #ifndef SYS_PROG_PP_ALLOCATOR_H
 #define SYS_PROG_PP_ALLOCATOR_H
 

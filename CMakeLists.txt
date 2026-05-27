@@ -33,11 +33,14 @@ set(INCLUDE_DIRS
 # ============================================================
 file(GLOB_RECURSE STORAGE_SOURCES 
     "project/storage_node/src/*.cpp"
+    "project/entrypoint/src/*.cpp"
 )
 
 file(GLOB_RECURSE COMMON_SOURCES 
     "project/common/src/*.cpp"
 )
+
+list(REMOVE_ITEM COMMON_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/project/common/src/Json.cpp")
 
 file(GLOB_RECURSE TEXT_HANDLER_SOURCES 
     "project/client/Text\ handler/src/*.cpp"
