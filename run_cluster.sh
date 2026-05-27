@@ -13,8 +13,8 @@ cmake --build . --target storage_client -j$(nproc)
 cd ..
 
 # Запускаем Storage-узлы (вывод подавляем)
-./build/storage_client --server 9001 ./storage_9001 > /dev/null 2>&1 &
-./build/storage_client --server 9002 ./storage_9002 > /dev/null 2>&1 &
+./build/storage_client --server 9001 ./storage_9001 > storage1.log 2>&1 &
+./build/storage_client --server 9002 ./storage_9002 > storage2.log 2>&1 &
 sleep 1
 
 # Запускаем Entrypoint (в фоне, лог пишем в файл)

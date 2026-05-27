@@ -1,0 +1,29 @@
+Entrypoint listening for clients on port 8080
+[Entrypoint] New client connected, fd=4
+[Entrypoint] Waiting for data from client...
+[Entrypoint] Received 29 bytes from client
+[Entrypoint] Processing command: ADD STORAGE "127.0.0.1:9001";
+[Entrypoint] ADD STORAGE command
+[Entrypoint] Adding storage: 127.0.0.1:9001
+Storage node added: 127.0.0.1:9001
+[Entrypoint] Sent: Storage node added
+[Entrypoint] Waiting for data from client...
+[Entrypoint] Received 29 bytes from client
+[Entrypoint] Processing command: ADD STORAGE "127.0.0.1:9002";
+[Entrypoint] ADD STORAGE command
+[Entrypoint] Adding storage: 127.0.0.1:9002
+Storage node added: 127.0.0.1:9002
+[Entrypoint] Sent: Storage node added
+[Entrypoint] Waiting for data from client...
+[Entrypoint] Received 29 bytes from client
+[Entrypoint] Processing command: CREATE DATABASE test_cluster;
+[Entrypoint] Database name: 'test_cluster'
+[Entrypoint] CREATE DATABASE detected
+[Entrypoint] db_name = 'test_cluster'
+[Entrypoint] db_name.empty() = 0
+[Entrypoint] Acquiring mutex lock...
+[Entrypoint] Mutex lock acquired
+[Entrypoint] Checking if database exists: test_cluster
+[Entrypoint] Checking storage_nodes_.empty() = 0
+[Entrypoint] Calling chooseStorageForNewDB()...
+[Entrypoint] chooseStorageForNewDB: START
