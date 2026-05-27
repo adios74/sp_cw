@@ -1,4 +1,3 @@
-// Auth.h
 #ifndef AUTH_H
 #define AUTH_H
 
@@ -12,6 +11,8 @@
 #include <iomanip>
 #include <chrono>
 #include <mutex>
+#include <fstream>
+#include <cstring>
 
 // ==================== SHA-256 ====================
 class SHA256 {
@@ -172,7 +173,7 @@ public:
     }
 };
 
-// ==================== JWT (упрощённый, без JSON) ====================
+// ==================== JWT (упрощённый) ====================
 class JWT {
 public:
     static std::string generate(const std::string& username, const std::string& secret,
@@ -237,13 +238,13 @@ private:
 
 // ==================== Права и операции ====================
 enum class Operation : uint8_t {
-    READ             = 1 << 0,  // 1
-    WRITE            = 1 << 1,  // 2
-    CREATE_TABLE     = 1 << 2,  // 4
-    DROP_TABLE       = 1 << 3,  // 8
-    DELETE_DATABASE  = 1 << 4,  // 16
-    CREATE_DATABASE  = 1 << 5,  // 32
-    ADMIN            = 1 << 6   // 64 (управление storage узлами)
+    READ             = 1 << 0,
+    WRITE            = 1 << 1,
+    CREATE_TABLE     = 1 << 2,
+    DROP_TABLE       = 1 << 3,
+    DELETE_DATABASE  = 1 << 4,
+    CREATE_DATABASE  = 1 << 5,
+    ADMIN            = 1 << 6
 };
 
 // ==================== Учётные записи ====================
@@ -252,41 +253,35 @@ struct User {
     std::string password_hash;
     std::string salt;
     std::vector<std::string> groups;
-    std::unordered_map<std::string, uint8_t> permissions; // db -> флаги
+    std::unordered_map<std::string, uint8_t> permissions;
 };
 
 struct Group {
     std::string name;
-    std::unordered_map<std::string, uint8_t> permissions; // db -> флаги
+    std::unordered_map<std::string, uint8_t> permissions;
 };
 
-// ==================== AuthManager ====================
+// ==================== AuthManager с персистентностью ====================
 class AuthManager {
 public:
-    AuthManager() {
-        // Генерируем случайный секрет для JWT
-        std::random_device rd;
-        std::mt19937 gen(rd());
-        std::uniform_int_distribution<> dis(0, 255);
-        std::stringstream ss;
-        for (int i = 0; i < 32; ++i) ss << std::hex << std::setw(2) << std::setfill('0') << dis(gen);
-        secret_ = ss.str();
-
-        // Группа "admin" с полными правами (пустая строка БД означает глобальные)
-        addGroup("admin");
-        // По умолчанию создаём администратора admin/admin
-        createUser("admin", "admin", true);
+    AuthManager(const std::string& storageFile = "auth.data") 
+        : storageFile_(storageFile)
+    {
+        if (!load()) {
+            // Первый запуск: генерируем секрет и создаём администратора по умолчанию
+            std::lock_guard<std::mutex> lock(mutex_);
+            generateSecret();
+            addGroupInternal("admin");
+            createUserInternal("admin", "admin", true);
+            save();
+        }
     }
 
     bool createUser(const std::string& username, const std::string& password, bool isAdmin = false) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (users_.count(username)) return false;
-        User u;
-        u.username = username;
-        u.salt = generateSalt();
-        u.password_hash = hashPassword(password, u.salt);
-        if (isAdmin) u.groups.push_back("admin");
-        users_[username] = u;
+        createUserInternal(username, password, isAdmin);
+        save();
         return true;
     }
 
@@ -296,6 +291,7 @@ public:
         auto& grps = users_[username].groups;
         if (std::find(grps.begin(), grps.end(), groupname) == grps.end()) {
             grps.push_back(groupname);
+            save();
             return true;
         }
         return false;
@@ -304,25 +300,29 @@ public:
     bool addGroup(const std::string& name) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (groups_.count(name)) return false;
-        groups_[name] = Group{name, {}};
+        addGroupInternal(name);
+        save();
         return true;
     }
 
     void setDefaultDBPermissions(const std::string& db, uint8_t flags) {
         std::lock_guard<std::mutex> lock(mutex_);
         default_db_permissions_[db] = flags;
+        save();
     }
 
     void setGroupDBPermissions(const std::string& groupname, const std::string& db, uint8_t flags) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!groups_.count(groupname)) return;
         groups_[groupname].permissions[db] = flags;
+        save();
     }
 
     void setUserDBPermissions(const std::string& username, const std::string& db, uint8_t flags) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!users_.count(username)) return;
         users_[username].permissions[db] = flags;
+        save();
     }
 
     std::string login(const std::string& username, const std::string& password) {
@@ -335,7 +335,6 @@ public:
     }
 
     std::string validateToken(const std::string& token) {
-        // JWT::validate обращается к secret_ без блокировки? secret_ не меняется после создания, безопасно.
         return JWT::validate(token, secret_);
     }
 
@@ -348,13 +347,9 @@ public:
 
     bool checkPermission(const std::string& username, const std::string& db, Operation op) {
         if (op == Operation::ADMIN) return isAdmin(username);
-        // Создание БД требует специального права или ADMIN
         if (op == Operation::CREATE_DATABASE) {
-            if (isAdmin(username)) return true;
-            // проверяем пользовательские права на глобальном уровне (empty db?)
-            // пусть CREATE_DATABASE проверяется по глобальному ключу "*" или пустой строке
-            // здесь просто разрешаем только админам
-            return false;
+            // Только администраторы могут создавать БД (можно расширить)
+            return isAdmin(username);
         }
 
         std::lock_guard<std::mutex> lock(mutex_);
@@ -363,33 +358,105 @@ public:
         const User& user = user_it->second;
         uint8_t required = static_cast<uint8_t>(op);
 
-        // 1. Личные права пользователя на эту БД
+        // Личные права пользователя
         auto perm_it = user.permissions.find(db);
-        if (perm_it != user.permissions.end()) {
-            if (perm_it->second & required) return true;
-        }
+        if (perm_it != user.permissions.end() && (perm_it->second & required)) return true;
 
-        // 2. Права групп пользователя
+        // Права групп
         for (const std::string& grp : user.groups) {
             auto grp_it = groups_.find(grp);
             if (grp_it != groups_.end()) {
                 auto p = grp_it->second.permissions.find(db);
-                if (p != grp_it->second.permissions.end() && (p->second & required)) {
-                    return true;
-                }
+                if (p != grp_it->second.permissions.end() && (p->second & required)) return true;
             }
         }
 
-        // 3. Права по умолчанию для БД
+        // Права по умолчанию
         auto def = default_db_permissions_.find(db);
-        if (def != default_db_permissions_.end() && (def->second & required)) {
-            return true;
-        }
+        if (def != default_db_permissions_.end() && (def->second & required)) return true;
 
         return false;
     }
 
+    // ---------- Новые методы для команд управления ----------
+    std::string listUsers() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::stringstream ss;
+        for (const auto& [name, user] : users_) {
+            ss << name;
+            if (std::find(user.groups.begin(), user.groups.end(), "admin") != user.groups.end())
+                ss << " (admin)";
+            ss << "\n";
+        }
+        return ss.str();
+    }
+
+    std::string listGroups() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::stringstream ss;
+        for (const auto& [name, grp] : groups_) ss << name << "\n";
+        return ss.str();
+    }
+
+    std::string getUserPermissions(const std::string& username) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = users_.find(username);
+        if (it == users_.end()) return "User not found\n";
+        const User& u = it->second;
+        std::stringstream ss;
+        ss << "User: " << username << "\nGroups: ";
+        for (size_t i = 0; i < u.groups.size(); ++i) {
+            if (i) ss << ", ";
+            ss << u.groups[i];
+        }
+        ss << "\nPersonal permissions:\n";
+        for (const auto& [db, flags] : u.permissions) {
+            ss << "  " << db << ": " << (int)flags << "\n";
+        }
+        for (const auto& grp_name : u.groups) {
+            auto git = groups_.find(grp_name);
+            if (git != groups_.end()) {
+                ss << "Group " << grp_name << " permissions:\n";
+                for (const auto& [db, flags] : git->second.permissions) {
+                    ss << "  " << db << ": " << (int)flags << "\n";
+                }
+            }
+        }
+        return ss.str();
+    }
+
+    std::string getGroupPermissions(const std::string& groupname) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = groups_.find(groupname);
+        if (it == groups_.end()) return "Group not found\n";
+        const Group& g = it->second;
+        std::stringstream ss;
+        ss << "Group: " << groupname << "\nPermissions:\n";
+        for (const auto& [db, flags] : g.permissions) {
+            ss << "  " << db << ": " << (int)flags << "\n";
+        }
+        return ss.str();
+    }
+
 private:
+    std::string storageFile_;
+    std::unordered_map<std::string, User> users_;
+    std::unordered_map<std::string, Group> groups_;
+    std::unordered_map<std::string, uint8_t> default_db_permissions_;
+    std::string secret_;
+    mutable std::mutex mutex_;
+
+    // ---------- вспомогательные методы (без блокировки) ----------
+    void generateSecret() {
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<> dis(0, 255);
+        std::stringstream ss;
+        for (int i = 0; i < 32; ++i) 
+            ss << std::hex << std::setw(2) << std::setfill('0') << dis(gen);
+        secret_ = ss.str();
+    }
+
     std::string generateSalt(size_t length = 16) {
         std::random_device rd;
         std::mt19937 gen(rd());
@@ -403,11 +470,138 @@ private:
         return SHA256::hash(salt + password);
     }
 
-    std::unordered_map<std::string, User> users_;
-    std::unordered_map<std::string, Group> groups_;
-    std::unordered_map<std::string, uint8_t> default_db_permissions_;
-    std::string secret_;
-    mutable std::mutex mutex_;
+    // Внутренние функции (вызываются при уже захваченном mutex)
+    void addGroupInternal(const std::string& name) {
+        groups_[name] = Group{name, {}};
+    }
+
+    void createUserInternal(const std::string& username, const std::string& password, bool isAdmin) {
+        User u;
+        u.username = username;
+        u.salt = generateSalt();
+        u.password_hash = hashPassword(password, u.salt);
+        if (isAdmin) u.groups.push_back("admin");
+        users_[username] = u;
+    }
+
+    // ---------- персистентность ----------
+    bool load() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::ifstream file(storageFile_);
+        if (!file.is_open()) return false;
+
+        users_.clear();
+        groups_.clear();
+        default_db_permissions_.clear();
+
+        std::string line;
+        while (std::getline(file, line)) {
+            if (line.empty()) continue;
+            std::istringstream iss(line);
+            std::string type;
+            std::getline(iss, type, ':');
+
+            if (type == "SECRET") {
+                std::getline(iss, secret_);
+            }
+            else if (type == "USER") {
+                User u;
+                std::string field;
+                std::getline(iss, u.username, ':');
+                std::getline(iss, u.password_hash, ':');
+                std::getline(iss, u.salt, ':');
+                std::getline(iss, field, ':'); // groups (comma-separated)
+                std::istringstream gs(field);
+                std::string g;
+                while (std::getline(gs, g, ',')) {
+                    if (!g.empty()) u.groups.push_back(g);
+                }
+                std::getline(iss, field); // permissions
+                if (!field.empty()) {
+                    std::istringstream ps(field);
+                    std::string perm;
+                    while (std::getline(ps, perm, ',')) {
+                        auto eq = perm.find('=');
+                        if (eq != std::string::npos) {
+                            std::string db = perm.substr(0, eq);
+                            uint8_t flags = std::stoi(perm.substr(eq+1));
+                            u.permissions[db] = flags;
+                        }
+                    }
+                }
+                users_[u.username] = u;
+            }
+            else if (type == "GROUP") {
+                Group g;
+                std::string field;
+                std::getline(iss, g.name, ':');
+                std::getline(iss, field);
+                if (!field.empty()) {
+                    std::istringstream ps(field);
+                    std::string perm;
+                    while (std::getline(ps, perm, ',')) {
+                        auto eq = perm.find('=');
+                        if (eq != std::string::npos) {
+                            std::string db = perm.substr(0, eq);
+                            uint8_t flags = std::stoi(perm.substr(eq+1));
+                            g.permissions[db] = flags;
+                        }
+                    }
+                }
+                groups_[g.name] = g;
+            }
+            else if (type == "DEFAULT") {
+                std::string field;
+                std::getline(iss, field);
+                auto eq = field.find('=');
+                if (eq != std::string::npos) {
+                    std::string db = field.substr(0, eq);
+                    uint8_t flags = std::stoi(field.substr(eq+1));
+                    default_db_permissions_[db] = flags;
+                }
+            }
+        }
+        return !secret_.empty();
+    }
+
+    void save() {
+        // Вызывается только под захваченным mutex_
+        std::ofstream file(storageFile_);
+        if (!file.is_open()) return;
+
+        file << "SECRET:" << secret_ << "\n";
+
+        for (const auto& [name, user] : users_) {
+            file << "USER:" << name << ":" << user.password_hash << ":" << user.salt << ":";
+            for (size_t i = 0; i < user.groups.size(); ++i) {
+                if (i > 0) file << ",";
+                file << user.groups[i];
+            }
+            file << ":";
+            bool first = true;
+            for (const auto& [db, flags] : user.permissions) {
+                if (!first) file << ",";
+                file << db << "=" << (int)flags;
+                first = false;
+            }
+            file << "\n";
+        }
+
+        for (const auto& [name, group] : groups_) {
+            file << "GROUP:" << name << ":";
+            bool first = true;
+            for (const auto& [db, flags] : group.permissions) {
+                if (!first) file << ",";
+                file << db << "=" << (int)flags;
+                first = false;
+            }
+            file << "\n";
+        }
+
+        for (const auto& [db, flags] : default_db_permissions_) {
+            file << "DEFAULT:" << db << "=" << (int)flags << "\n";
+        }
+    }
 };
 
 #endif // AUTH_H

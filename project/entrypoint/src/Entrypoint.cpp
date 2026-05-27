@@ -6,8 +6,10 @@
 #include <cctype>
 #include <regex>
 
-Entrypoint::Entrypoint(int client_port)
-    : client_port_(client_port), server_fd_(-1), running_(false) {}
+// ==================== Реализация Entrypoint ====================
+
+Entrypoint::Entrypoint(int client_port, const std::string& authFile)
+    : client_port_(client_port), server_fd_(-1), running_(false), auth_(authFile) {}
 
 Entrypoint::~Entrypoint() { stop(); }
 
@@ -19,7 +21,7 @@ void Entrypoint::start() {
     running_ = true;
     std::cout << "Entrypoint listening for clients on port " << client_port_ << std::endl;
 
-    // При желании здесь можно задать дефолтные права для новых баз данных
+    // Дефолтные права для новых БД (опционально)
     // auth_.setDefaultDBPermissions("mydb", (uint8_t)Operation::READ | (uint8_t)Operation::WRITE);
 
     while (running_) {
@@ -80,68 +82,32 @@ std::string Entrypoint::forwardToStorage(const std::string& host, int port, cons
     std::cerr << "[Entrypoint] Host: " << host << std::endl;
     std::cerr << "[Entrypoint] Port: " << port << std::endl;
     std::cerr << "[Entrypoint] SQL: " << sql << std::endl;
-    std::cerr << "[Entrypoint] Creating socket..." << std::endl;
     
     Socket sock;
     try {
-        std::cerr << "[Entrypoint] Connecting to " << host << ":" << port << "..." << std::endl;
         sock.connect(host, port);
-        std::cerr << "[Entrypoint] Connected successfully!" << std::endl;
-        
         sock.setTimeout(5);
-        std::cerr << "[Entrypoint] Timeout set to 5 seconds" << std::endl;
-        
-        std::cerr << "[Entrypoint] Sending SQL (" << sql.size() << " bytes)..." << std::endl;
         sock.send(sql);
-        std::cerr << "[Entrypoint] SQL sent" << std::endl;
-        
-        std::cerr << "[Entrypoint] Shutting down write..." << std::endl;
         sock.shutdownWrite();
-        std::cerr << "[Entrypoint] Write shutdown complete" << std::endl;
-        
-        std::cerr << "[Entrypoint] Waiting for response..." << std::endl;
         std::string response = sock.recv();
-        
-        std::cerr << "[Entrypoint] Response received (" << response.size() << " bytes)" << std::endl;
-        std::cerr << "[Entrypoint] Response content: " << response << std::endl;
-        std::cerr << "[Entrypoint] =========================================" << std::endl;
-        
+        std::cerr << "[Entrypoint] Response: " << response << std::endl;
         sock.close();
         return response;
     } catch (const std::exception& e) {
-        std::cerr << "[Entrypoint] EXCEPTION in forwardToStorage: " << e.what() << std::endl;
-        std::cerr << "[Entrypoint] =========================================" << std::endl;
+        std::cerr << "[Entrypoint] EXCEPTION: " << e.what() << std::endl;
         return "Error: storage node " + host + ":" + std::to_string(port) +
                " is unavailable (" + e.what() + ")\n";
     }
 }
 
 std::pair<std::string, int> Entrypoint::chooseStorageForNewDB() {
-    std::cerr << "[Entrypoint] chooseStorageForNewDB: START" << std::endl;
-    std::cerr << "[Entrypoint] chooseStorageForNewDB: mutex locked" << std::endl;
-    std::cerr << "[Entrypoint] chooseStorageForNewDB: storage_nodes_.size() = " << storage_nodes_.size() << std::endl;
-    
+    std::lock_guard<std::mutex> lock(mutex_);
     if (storage_nodes_.empty()) {
-        std::cerr << "[Entrypoint] chooseStorageForNewDB: No storage nodes!" << std::endl;
         throw std::runtime_error("No storage nodes available");
     }
-    
-    for (size_t i = 0; i < storage_nodes_.size(); i++) {
-        std::cerr << "[Entrypoint] chooseStorageForNewDB: node[" << i << "] = " 
-                  << storage_nodes_[i].first << ":" << storage_nodes_[i].second << std::endl;
-    }
-    
-    std::cerr << "[Entrypoint] chooseStorageForNewDB: next_node_index_ = " << next_node_index_ << std::endl;
     size_t index = next_node_index_ % storage_nodes_.size();
-    std::cerr << "[Entrypoint] chooseStorageForNewDB: computed index = " << index << std::endl;
-    
     auto& node = storage_nodes_[index];
-    std::cerr << "[Entrypoint] chooseStorageForNewDB: selected node = " << node.first << ":" << node.second << std::endl;
-    
     next_node_index_++;
-    std::cerr << "[Entrypoint] chooseStorageForNewDB: next_node_index_ incremented to " << next_node_index_ << std::endl;
-    
-    std::cerr << "[Entrypoint] chooseStorageForNewDB: returning" << std::endl;
     return node;
 }
 
@@ -189,22 +155,16 @@ void Entrypoint::handleClient(int client_fd) {
     client.setFd(client_fd);
     std::string buffer;
     std::string current_db;
-    std::string current_user;   // имя пользователя после успешного BEARER
+    std::string current_user;
 
     std::cerr << "[Entrypoint] New client connected, fd=" << client_fd << std::endl;
     
     while (true) {
         try {
-            std::cerr << "[Entrypoint] Waiting for data from client..." << std::endl;
             std::string request = client.recv();
-            std::cerr << "[Entrypoint] Received " << request.size() << " bytes from client" << std::endl;
-            
-            if (request.empty()) {
-                std::cerr << "[Entrypoint] Empty request, client disconnected" << std::endl;
-                break;
-            }
-            
+            if (request.empty()) break;
             buffer += request;
+
             size_t pos;
             while ((pos = buffer.find(';')) != std::string::npos) {
                 std::string command = buffer.substr(0, pos + 1);
@@ -213,12 +173,10 @@ void Entrypoint::handleClient(int client_fd) {
                 command.erase(command.find_last_not_of(" \t\n\r") + 1);
                 if (command.empty()) continue;
                 
-                std::cerr << "[Entrypoint] Processing command: " << command << std::endl;
-                
                 std::string upper_cmd = command;
                 std::transform(upper_cmd.begin(), upper_cmd.end(), upper_cmd.begin(), ::toupper);
                 
-                // ------------- Аутентификация -------------
+                // --- Аутентификация ---
                 if (upper_cmd.find("LOGIN") == 0 && current_user.empty()) {
                     if (command.back() == ';') command.pop_back(); 
                     std::istringstream iss(command);
@@ -233,47 +191,31 @@ void Entrypoint::handleClient(int client_fd) {
                     continue;
                 }
 
-if (upper_cmd.find("BEARER ") == 0 && current_user.empty()) {
-    std::cerr << "[DEBUG] BEARER command received" << std::endl;
-
-    std::string token = command.substr(7);
-    // удаляем ';' в конце, если есть
-    if (!token.empty() && token.back() == ';') token.pop_back();
-    // обрезаем пробелы
-    size_t start = token.find_first_not_of(" \t");
-    size_t end = token.find_last_not_of(" \t");
-    if (start != std::string::npos)
-        token = token.substr(start, end - start + 1);
-
-    std::cerr << "[DEBUG] Token after cleanup: '" << token << "'" << std::endl;
-
-    std::string user = auth_.validateToken(token);
-    std::cerr << "[DEBUG] validateToken returned: '" << user << "'" << std::endl;
-
-    if (user.empty()) {
-        std::cerr << "[DEBUG] Token invalid or expired" << std::endl;
-        client.send("Error: invalid or expired token\n");
-    } else {
-        current_user = user;
-        std::cerr << "[DEBUG] User authenticated: " << current_user << std::endl;
-        client.send("OK\n");
-        std::cerr << "[DEBUG] Sent 'OK' to client" << std::endl;
-    }
-    continue;
-}
+                if (upper_cmd.find("BEARER ") == 0 && current_user.empty()) {
+                    std::string token = command.substr(7);
+                    if (!token.empty() && token.back() == ';') token.pop_back();
+                    size_t st = token.find_first_not_of(" \t");
+                    size_t en = token.find_last_not_of(" \t");
+                    if (st != std::string::npos)
+                        token = token.substr(st, en - st + 1);
+                    std::string user = auth_.validateToken(token);
+                    if (user.empty()) {
+                        client.send("Error: invalid or expired token\n");
+                    } else {
+                        current_user = user;
+                        client.send("OK\n");
+                    }
+                    continue;
+                }
 
                 if (current_user.empty()) {
                     client.send("Error: authentication required (use LOGIN then BEARER)\n");
                     continue;
                 }
                 
-                // ------------- Извлечение имени БД -------------
                 std::string db_name = extractDatabaseName(command, current_db);
-                std::cerr << "[Entrypoint] Database name: '" << db_name << "'" << std::endl;
 
-                // ------------- Проверка прав и выполнение -------------
-                
-                // 1. Административные команды кластера
+                // --- Административные команды ---
                 if (upper_cmd.find("ADD STORAGE") == 0 ||
                     upper_cmd.find("REMOVE STORAGE") == 0 ||
                     upper_cmd.find("SHOW STORAGES") == 0) {
@@ -283,53 +225,183 @@ if (upper_cmd.find("BEARER ") == 0 && current_user.empty()) {
                         continue;
                     }
                     
-                    // Обработка ADD STORAGE
                     if (upper_cmd.find("ADD STORAGE") == 0) {
                         std::regex add_regex(R"(ADD STORAGE\s+\"([^\"]+):(\d+)\")");
                         std::smatch m;
                         if (std::regex_search(command, m, add_regex)) {
-                            std::string host = m[1].str();
-                            int port = std::stoi(m[2].str());
-                            addStorageNode(host, port);
+                            addStorageNode(m[1].str(), std::stoi(m[2].str()));
                             client.send("Storage node added\n");
                         } else {
                             client.send("Error: usage ADD STORAGE \"host:port\"\n");
                         }
-                    }
-                    // Обработка REMOVE STORAGE
-                    else if (upper_cmd.find("REMOVE STORAGE") == 0) {
+                    } else if (upper_cmd.find("REMOVE STORAGE") == 0) {
                         std::regex rem_regex(R"(REMOVE STORAGE\s+\"([^\"]+):(\d+)\")");
                         std::smatch m;
                         if (std::regex_search(command, m, rem_regex)) {
-                            std::string host = m[1].str();
-                            int port = std::stoi(m[2].str());
-                            removeStorageNode(host, port);
+                            removeStorageNode(m[1].str(), std::stoi(m[2].str()));
                             client.send("Storage node removed\n");
                         } else {
                             client.send("Error: usage REMOVE STORAGE \"host:port\"\n");
                         }
-                    }
-                    // Обработка SHOW STORAGES
-                    else {
+                    } else {
                         std::lock_guard<std::mutex> lock(mutex_);
                         std::stringstream ss;
                         for (const auto& node : storage_nodes_)
                             ss << node.first << ":" << node.second << "\n";
-                        std::string response = ss.str();
-                        if (response.empty()) response = "No storage nodes\n";
-                        client.send(response);
+                        std::string resp = ss.str();
+                        if (resp.empty()) resp = "No storage nodes\n";
+                        client.send(resp);
                     }
                     continue;
                 }
                 
-                // 2. USE – смена текущей БД
+                // --- Управление пользователями (только ADMIN) ---
+                if (upper_cmd.find("CREATE USER") == 0 ||
+                    upper_cmd.find("CREATE GROUP") == 0 ||
+                    upper_cmd.find("ADD USER") == 0 ||
+                    upper_cmd.find("SET PERMISSION ON") == 0 ||
+                    upper_cmd.find("SET DEFAULT PERMISSION ON") == 0 ||
+                    upper_cmd.find("SHOW USERS") == 0 ||
+                    upper_cmd.find("SHOW GROUPS") == 0 ||
+                    upper_cmd.find("SHOW PERMISSIONS") == 0) {
+
+                    if (!auth_.checkPermission(current_user, "", Operation::ADMIN)) {
+                        client.send("Error: administrator privileges required\n");
+                        continue;
+                    }
+
+                    // CREATE USER "username" "password" [ADMIN]
+                    if (upper_cmd.find("CREATE USER") == 0) {
+                        std::regex re(R"(CREATE USER\s+\"([^\"]+)\"\s+\"([^\"]+)\"(?:\s+ADMIN)?)");
+                        std::smatch m;
+                        if (std::regex_search(command, m, re)) {
+                            std::string user = m[1];
+                            std::string pass = m[2];
+                            bool admin = (command.find("ADMIN") != std::string::npos);
+                            if (auth_.createUser(user, pass)) {
+                                if (admin) {
+                                    auth_.addUserToGroup(user, "admin");
+                                }
+                                client.send("User created\n");
+                            } else {
+                                client.send("Error: user already exists\n");
+                            }
+                        } else {
+                            client.send("Error: usage CREATE USER \"username\" \"password\" [ADMIN]\n");
+                        }
+                    }
+                    // CREATE GROUP "groupname"
+                    else if (upper_cmd.find("CREATE GROUP") == 0) {
+                        std::regex re(R"(CREATE GROUP\s+\"([^\"]+)\")");
+                        std::smatch m;
+                        if (std::regex_search(command, m, re)) {
+                            if (auth_.addGroup(m[1])) {
+                                client.send("Group created\n");
+                            } else {
+                                client.send("Error: group already exists\n");
+                            }
+                        } else {
+                            client.send("Error: usage CREATE GROUP \"groupname\"\n");
+                        }
+                    }
+                    // ADD USER "username" TO GROUP "groupname"
+                    else if (upper_cmd.find("ADD USER") == 0) {
+                        std::regex re(R"(ADD USER\s+\"([^\"]+)\"\s+TO GROUP\s+\"([^\"]+)\")");
+                        std::smatch m;
+                        if (std::regex_search(command, m, re)) {
+                            if (auth_.addUserToGroup(m[1], m[2])) {
+                                client.send("User added to group\n");
+                            } else {
+                                client.send("Error: user or group not found, or already in group\n");
+                            }
+                        } else {
+                            client.send("Error: usage ADD USER \"username\" TO GROUP \"groupname\"\n");
+                        }
+                    }
+                    // SET PERMISSION ON "db" FOR USER "username" = <flags>
+                    else if (upper_cmd.find("SET PERMISSION ON") == 0 && upper_cmd.find("FOR USER") != std::string::npos) {
+                        std::regex re(R"(SET PERMISSION ON\s+\"([^\"]+)\"\s+FOR USER\s+\"([^\"]+)\"\s*=\s*(\d+))");
+                        std::smatch m;
+                        if (std::regex_search(command, m, re)) {
+                            std::string db = m[1];
+                            std::string user = m[2];
+                            int flags = std::stoi(m[3]);
+                            auth_.setUserDBPermissions(user, db, static_cast<uint8_t>(flags));
+                            client.send("Permissions set\n");
+                        } else {
+                            client.send("Error: usage SET PERMISSION ON \"db\" FOR USER \"username\" = <flags>\n");
+                        }
+                    }
+                    // SET PERMISSION ON "db" FOR GROUP "groupname" = <flags>
+                    else if (upper_cmd.find("SET PERMISSION ON") == 0 && upper_cmd.find("FOR GROUP") != std::string::npos) {
+                        std::regex re(R"(SET PERMISSION ON\s+\"([^\"]+)\"\s+FOR GROUP\s+\"([^\"]+)\"\s*=\s*(\d+))");
+                        std::smatch m;
+                        if (std::regex_search(command, m, re)) {
+                            std::string db = m[1];
+                            std::string grp = m[2];
+                            int flags = std::stoi(m[3]);
+                            auth_.setGroupDBPermissions(grp, db, static_cast<uint8_t>(flags));
+                            client.send("Permissions set\n");
+                        } else {
+                            client.send("Error: usage SET PERMISSION ON \"db\" FOR GROUP \"groupname\" = <flags>\n");
+                        }
+                    }
+                    // SET DEFAULT PERMISSION ON "db" = <flags>
+                    else if (upper_cmd.find("SET DEFAULT PERMISSION ON") == 0) {
+                        std::regex re(R"(SET DEFAULT PERMISSION ON\s+\"([^\"]+)\"\s*=\s*(\d+))");
+                        std::smatch m;
+                        if (std::regex_search(command, m, re)) {
+                            std::string db = m[1];
+                            int flags = std::stoi(m[2]);
+                            auth_.setDefaultDBPermissions(db, static_cast<uint8_t>(flags));
+                            client.send("Default permissions set\n");
+                        } else {
+                            client.send("Error: usage SET DEFAULT PERMISSION ON \"db\" = <flags>\n");
+                        }
+                    }
+                    // SHOW USERS
+                    else if (upper_cmd.find("SHOW USERS") == 0) {
+                        client.send(auth_.listUsers());
+                    }
+                    // SHOW GROUPS
+                    else if (upper_cmd.find("SHOW GROUPS") == 0) {
+                        client.send(auth_.listGroups());
+                    }
+                    // SHOW PERMISSIONS FOR USER "username"
+                    else if (upper_cmd.find("SHOW PERMISSIONS FOR USER") == 0) {
+                        std::regex re(R"(SHOW PERMISSIONS FOR USER\s+\"([^\"]+)\")");
+                        std::smatch m;
+                        if (std::regex_search(command, m, re)) {
+                            client.send(auth_.getUserPermissions(m[1]));
+                        } else {
+                            client.send("Error: usage SHOW PERMISSIONS FOR USER \"username\"\n");
+                        }
+                    }
+                    // SHOW PERMISSIONS FOR GROUP "groupname"
+                    else if (upper_cmd.find("SHOW PERMISSIONS FOR GROUP") == 0) {
+                        std::regex re(R"(SHOW PERMISSIONS FOR GROUP\s+\"([^\"]+)\")");
+                        std::smatch m;
+                        if (std::regex_search(command, m, re)) {
+                            client.send(auth_.getGroupPermissions(m[1]));
+                        } else {
+                            client.send("Error: usage SHOW PERMISSIONS FOR GROUP \"groupname\"\n");
+                        }
+                    }
+                    // SHOW PERMISSIONS (без параметров) – краткая подсказка
+                    else if (upper_cmd.find("SHOW PERMISSIONS") == 0) {
+                        client.send("Use: SHOW PERMISSIONS FOR USER \"name\" or FOR GROUP \"name\"\n");
+                    }
+                    continue;
+                }
+                
+                // --- USE ---
                 if (upper_cmd.find("USE ") == 0) {
                     current_db = db_name;
                     client.send("Using database " + current_db + "\n");
                     continue;
                 }
                 
-                // 3. CREATE DATABASE
+                // --- CREATE DATABASE ---
                 if (upper_cmd.find("CREATE DATABASE") == 0) {
                     if (!auth_.checkPermission(current_user, "", Operation::CREATE_DATABASE)) {
                         client.send("Error: permission denied (CREATE DATABASE)\n");
@@ -359,7 +431,7 @@ if (upper_cmd.find("BEARER ") == 0 && current_user.empty()) {
                     continue;
                 }
                 
-                // 4. DROP DATABASE
+                // --- DROP DATABASE ---
                 if (upper_cmd.find("DROP DATABASE") == 0) {
                     if (!auth_.checkPermission(current_user, db_name, Operation::DELETE_DATABASE)) {
                         client.send("Error: permission denied (DROP DATABASE)\n");
@@ -379,31 +451,25 @@ if (upper_cmd.find("BEARER ") == 0 && current_user.empty()) {
                             continue;
                         }
                         target = it->second;
-                        // Удаляем из маппинга после успешного выполнения на storage,
-                        // но если storage вернёт ошибку, то маппинг останется. Можно оптимизировать.
                     }
                     
                     std::string response = forwardToStorage(target.first, target.second, command);
-                    // Если storage сообщил об успехе (например, "Database dropped"), удаляем маппинг
                     if (response.find("Database dropped") != std::string::npos ||
                         response.find("dropped") != std::string::npos) {
                         std::lock_guard<std::mutex> lock(mutex_);
                         db_to_storage_.erase(db_name);
-                        // Если текущая БД удалена, сбрасываем current_db
                         if (current_db == db_name) current_db.clear();
                     }
                     client.send(response);
                     continue;
                 }
                 
-                // 5. CREATE TABLE / DROP TABLE / SELECT / INSERT / UPDATE / DELETE
-                // Требуют существующей БД и проверки прав
+                // --- Прочие SQL-команды ---
                 if (db_name.empty()) {
                     client.send("Error: no database selected or specified\n");
                     continue;
                 }
                 
-                // Получаем целевой storage
                 std::pair<std::string, int> target;
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
@@ -415,20 +481,18 @@ if (upper_cmd.find("BEARER ") == 0 && current_user.empty()) {
                     target = it->second;
                 }
                 
-                // Определяем операцию и проверяем права
                 bool allowed = false;
-                if (upper_cmd.find("CREATE TABLE") == 0) {
+                if (upper_cmd.find("CREATE TABLE") == 0)
                     allowed = auth_.checkPermission(current_user, db_name, Operation::CREATE_TABLE);
-                } else if (upper_cmd.find("DROP TABLE") == 0) {
+                else if (upper_cmd.find("DROP TABLE") == 0)
                     allowed = auth_.checkPermission(current_user, db_name, Operation::DROP_TABLE);
-                } else if (upper_cmd.find("SELECT") == 0) {
+                else if (upper_cmd.find("SELECT") == 0)
                     allowed = auth_.checkPermission(current_user, db_name, Operation::READ);
-                } else if (upper_cmd.find("INSERT") == 0 ||
-                           upper_cmd.find("UPDATE") == 0 ||
-                           upper_cmd.find("DELETE") == 0) {
+                else if (upper_cmd.find("INSERT") == 0 ||
+                         upper_cmd.find("UPDATE") == 0 ||
+                         upper_cmd.find("DELETE") == 0)
                     allowed = auth_.checkPermission(current_user, db_name, Operation::WRITE);
-                } else {
-                    // Неизвестная команда
+                else {
                     client.send("Error: unsupported command\n");
                     continue;
                 }
@@ -438,7 +502,6 @@ if (upper_cmd.find("BEARER ") == 0 && current_user.empty()) {
                     continue;
                 }
                 
-                // Пересылка на storage
                 std::string response = forwardToStorage(target.first, target.second, command);
                 client.send(response);
             }
