@@ -59,7 +59,6 @@ void Entrypoint::removeStorageNode(const std::string& host, int port) {
         std::cerr << "Storage node not found: " << host << ":" << port << std::endl;
         return;
     }
-    // Удаляем все БД, которые размещены на этом узле
     for (auto db_it = db_to_storage_.begin(); db_it != db_to_storage_.end(); ) {
         if (db_it->second == *it) {
             std::cout << "Database " << db_it->first << " will be inaccessible (storage removed)" << std::endl;
@@ -73,28 +72,72 @@ void Entrypoint::removeStorageNode(const std::string& host, int port) {
 }
 
 std::string Entrypoint::forwardToStorage(const std::string& host, int port, const std::string& sql) {
+    std::cerr << "[Entrypoint] ========== FORWARDING TO STORAGE ==========" << std::endl;
+    std::cerr << "[Entrypoint] Host: " << host << std::endl;
+    std::cerr << "[Entrypoint] Port: " << port << std::endl;
+    std::cerr << "[Entrypoint] SQL: " << sql << std::endl;
+    std::cerr << "[Entrypoint] Creating socket..." << std::endl;
+    
     Socket sock;
     try {
-        sock.setTimeout(2);   // таймаут на всякий случай
+        std::cerr << "[Entrypoint] Connecting to " << host << ":" << port << "..." << std::endl;
         sock.connect(host, port);
-        sock.send(sql + ";");
-        sock.shutdownWrite(); // сигнализируем конец передачи, сервер получит EOF
-        std::string response = sock.recv(); // теперь recv прочитает ответ и завершится
+        std::cerr << "[Entrypoint] Connected successfully!" << std::endl;
+        
+        sock.setTimeout(5);
+        std::cerr << "[Entrypoint] Timeout set to 5 seconds" << std::endl;
+        
+        std::cerr << "[Entrypoint] Sending SQL (" << sql.size() << " bytes)..." << std::endl;
+        sock.send(sql);
+        std::cerr << "[Entrypoint] SQL sent" << std::endl;
+        
+        std::cerr << "[Entrypoint] Shutting down write..." << std::endl;
+        sock.shutdownWrite();
+        std::cerr << "[Entrypoint] Write shutdown complete" << std::endl;
+        
+        std::cerr << "[Entrypoint] Waiting for response..." << std::endl;
+        std::string response = sock.recv();
+        
+        std::cerr << "[Entrypoint] Response received (" << response.size() << " bytes)" << std::endl;
+        std::cerr << "[Entrypoint] Response content: " << response << std::endl;
+        std::cerr << "[Entrypoint] =========================================" << std::endl;
+        
         sock.close();
         return response;
     } catch (const std::exception& e) {
-        return std::string("Error: storage node ") + host + ":" + std::to_string(port) + 
+        std::cerr << "[Entrypoint] EXCEPTION in forwardToStorage: " << e.what() << std::endl;
+        std::cerr << "[Entrypoint] =========================================" << std::endl;
+        return "Error: storage node " + host + ":" + std::to_string(port) +
                " is unavailable (" + e.what() + ")\n";
     }
 }
 
 std::pair<std::string, int> Entrypoint::chooseStorageForNewDB() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::cerr << "[Entrypoint] chooseStorageForNewDB: START" << std::endl;
+    std::cerr << "[Entrypoint] chooseStorageForNewDB: mutex locked" << std::endl;
+    std::cerr << "[Entrypoint] chooseStorageForNewDB: storage_nodes_.size() = " << storage_nodes_.size() << std::endl;
+    
     if (storage_nodes_.empty()) {
+        std::cerr << "[Entrypoint] chooseStorageForNewDB: No storage nodes!" << std::endl;
         throw std::runtime_error("No storage nodes available");
     }
-    auto& node = storage_nodes_[next_node_index_ % storage_nodes_.size()];
+    
+    for (size_t i = 0; i < storage_nodes_.size(); i++) {
+        std::cerr << "[Entrypoint] chooseStorageForNewDB: node[" << i << "] = " 
+                  << storage_nodes_[i].first << ":" << storage_nodes_[i].second << std::endl;
+    }
+    
+    std::cerr << "[Entrypoint] chooseStorageForNewDB: next_node_index_ = " << next_node_index_ << std::endl;
+    size_t index = next_node_index_ % storage_nodes_.size();
+    std::cerr << "[Entrypoint] chooseStorageForNewDB: computed index = " << index << std::endl;
+    
+    auto& node = storage_nodes_[index];
+    std::cerr << "[Entrypoint] chooseStorageForNewDB: selected node = " << node.first << ":" << node.second << std::endl;
+    
     next_node_index_++;
+    std::cerr << "[Entrypoint] chooseStorageForNewDB: next_node_index_ incremented to " << next_node_index_ << std::endl;
+    
+    std::cerr << "[Entrypoint] chooseStorageForNewDB: returning" << std::endl;
     return node;
 }
 
@@ -105,16 +148,14 @@ std::string Entrypoint::extractDatabaseName(const std::string& sql, const std::s
     if (start == std::string::npos) return current_db;
     upper = upper.substr(start);
     
-    // CREATE DATABASE name
     if (upper.starts_with("CREATE DATABASE ") || upper.starts_with("CREATE DATABASE\n")) {
-        size_t keyword_end = upper.find_first_not_of(" \t", 15); // после "CREATE DATABASE"
+        size_t keyword_end = upper.find_first_not_of(" \t", 15);
         if (keyword_end == std::string::npos) return "";
         size_t name_end = upper.find_first_of(" ;\t\n\r", keyword_end);
         if (name_end == std::string::npos) name_end = upper.size();
         return sql.substr(start + keyword_end, name_end - keyword_end);
     }
     
-    // USE name
     if (upper.starts_with("USE ")) {
         size_t p = upper.find_first_of(" \t", 4);
         if (p != std::string::npos) {
@@ -123,7 +164,6 @@ std::string Entrypoint::extractDatabaseName(const std::string& sql, const std::s
         return sql.substr(start + 4);
     }
     
-    // Ищем квалифицированные имена вида db.table
     std::regex db_table_regex(R"(\b([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*))");
     std::smatch match;
     if (std::regex_search(sql, match, db_table_regex)) {
@@ -137,11 +177,20 @@ void Entrypoint::handleClient(int client_fd) {
     client.setFd(client_fd);
     std::string buffer;
     std::string current_db;
-
+    
+    std::cerr << "[Entrypoint] New client connected, fd=" << client_fd << std::endl;
+    
     while (true) {
         try {
+            std::cerr << "[Entrypoint] Waiting for data from client..." << std::endl;
             std::string request = client.recv();
-            if (request.empty()) break;
+            std::cerr << "[Entrypoint] Received " << request.size() << " bytes from client" << std::endl;
+            
+            if (request.empty()) {
+                std::cerr << "[Entrypoint] Empty request, client disconnected" << std::endl;
+                break;
+            }
+            
             buffer += request;
             size_t pos;
             while ((pos = buffer.find(';')) != std::string::npos) {
@@ -151,29 +200,41 @@ void Entrypoint::handleClient(int client_fd) {
                 command.erase(command.find_last_not_of(" \t\n\r") + 1);
                 if (command.empty()) continue;
                 
+                std::cerr << "[Entrypoint] Processing command: " << command << std::endl;
+                
                 std::string upper_cmd = command;
                 std::transform(upper_cmd.begin(), upper_cmd.end(), upper_cmd.begin(), ::toupper);
                 
-                // Административные команды
-                if (upper_cmd.starts_with("ADD STORAGE ")) {
+                // ADD STORAGE
+                if (upper_cmd.find("ADD STORAGE") == 0) {
+                    std::cerr << "[Entrypoint] ADD STORAGE command" << std::endl;
                     std::regex add_regex(R"(ADD STORAGE\s+\"([^\"]+):(\d+)\")");
                     std::smatch m;
                     if (std::regex_search(command, m, add_regex)) {
                         std::string host = m[1].str();
                         int port = std::stoi(m[2].str());
+                        std::cerr << "[Entrypoint] Adding storage: " << host << ":" << port << std::endl;
                         addStorageNode(host, port);
-                        client.send("Storage node added\n");
+                        std::string response = "Storage node added\n";
+                        client.send(response);
+                        std::cerr << "[Entrypoint] Sent: " << response;
                     } else {
-                        client.send("Error: usage ADD STORAGE \"host:port\"\n");
+                        std::string error = "Error: usage ADD STORAGE \"host:port\"\n";
+                        client.send(error);
+                        std::cerr << "[Entrypoint] Sent error: " << error;
                     }
                     continue;
                 }
-                if (upper_cmd.starts_with("REMOVE STORAGE ")) {
+                
+                // REMOVE STORAGE
+                if (upper_cmd.find("REMOVE STORAGE") == 0) {
+                    std::cerr << "[Entrypoint] REMOVE STORAGE command" << std::endl;
                     std::regex rem_regex(R"(REMOVE STORAGE\s+\"([^\"]+):(\d+)\")");
                     std::smatch m;
                     if (std::regex_search(command, m, rem_regex)) {
                         std::string host = m[1].str();
                         int port = std::stoi(m[2].str());
+                        std::cerr << "[Entrypoint] Removing storage: " << host << ":" << port << std::endl;
                         removeStorageNode(host, port);
                         client.send("Storage node removed\n");
                     } else {
@@ -181,53 +242,90 @@ void Entrypoint::handleClient(int client_fd) {
                     }
                     continue;
                 }
-                if (upper_cmd.starts_with("SHOW STORAGES")) {
+                
+                // SHOW STORAGES
+                if (upper_cmd.find("SHOW STORAGES") == 0) {
+                    std::cerr << "[Entrypoint] SHOW STORAGES command" << std::endl;
                     std::lock_guard<std::mutex> lock(mutex_);
                     std::stringstream ss;
                     for (const auto& node : storage_nodes_)
                         ss << node.first << ":" << node.second << "\n";
-                    client.send(ss.str());
+                    std::string response = ss.str();
+                    if (response.empty()) response = "No storage nodes\n";
+                    client.send(response);
+                    std::cerr << "[Entrypoint] Sent storage list: " << response;
                     continue;
                 }
 
-                // Определяем имя БД
+                // Extract database name for other commands
                 std::string db_name = extractDatabaseName(command, current_db);
+                std::cerr << "[Entrypoint] Database name: '" << db_name << "'" << std::endl;
 
                 // CREATE DATABASE
                 if (upper_cmd.find("CREATE DATABASE") == 0) {
+                    std::cerr << "[Entrypoint] CREATE DATABASE detected" << std::endl;
+                    std::cerr << "[Entrypoint] db_name = '" << db_name << "'" << std::endl;
+                    std::cerr << "[Entrypoint] db_name.empty() = " << db_name.empty() << std::endl;
+                    
                     if (db_name.empty()) {
+                        std::cerr << "[Entrypoint] Database name is empty, sending error" << std::endl;
                         client.send("Error: invalid database name\n");
                         continue;
                     }
+                    
+                    std::cerr << "[Entrypoint] Acquiring mutex lock..." << std::endl;
                     std::pair<std::string, int> target;
                     {
                         std::lock_guard<std::mutex> lock(mutex_);
+                        std::cerr << "[Entrypoint] Mutex lock acquired" << std::endl;
+                        
+                        std::cerr << "[Entrypoint] Checking if database exists: " << db_name << std::endl;
                         if (db_to_storage_.count(db_name)) {
+                            std::cerr << "[Entrypoint] Database already exists!" << std::endl;
                             client.send("Error: database already exists\n");
                             continue;
                         }
+                        
+                        std::cerr << "[Entrypoint] Checking storage_nodes_.empty() = " << storage_nodes_.empty() << std::endl;
                         if (storage_nodes_.empty()) {
+                            std::cerr << "[Entrypoint] No storage nodes available!" << std::endl;
                             client.send("Error: no storage nodes available\n");
                             continue;
                         }
+                        
+                        std::cerr << "[Entrypoint] Calling chooseStorageForNewDB()..." << std::endl;
                         target = chooseStorageForNewDB();
+                        std::cerr << "[Entrypoint] Storage chosen: " << target.first << ":" << target.second << std::endl;
+                        
                         db_to_storage_[db_name] = target;
+                        std::cerr << "[Entrypoint] Database mapped to storage" << std::endl;
                     }
+                    std::cerr << "[Entrypoint] Mutex released" << std::endl;
+                    
+                    std::cerr << "[Entrypoint] Calling forwardToStorage..." << std::endl;
                     std::string response = forwardToStorage(target.first, target.second, command);
+                    std::cerr << "[Entrypoint] forwardToStorage returned, response size=" << response.size() << std::endl;
+                    std::cerr << "[Entrypoint] Response content: " << response << std::endl;
+                    
                     client.send(response);
+                    std::cerr << "[Entrypoint] Response sent to client" << std::endl;
                     continue;
                 }
 
                 // USE
                 if (upper_cmd.find("USE ") == 0) {
                     current_db = db_name;
-                    client.send("Using database " + current_db + "\n");
+                    std::string response = "Using database " + current_db + "\n";
+                    client.send(response);
+                    std::cerr << "[Entrypoint] Sent: " << response;
                     continue;
                 }
 
-                // Для других команд БД должна быть определена и существовать
+                // For other SQL commands (SELECT, INSERT, UPDATE, DELETE, etc.)
                 if (db_name.empty()) {
-                    client.send("Error: no database selected or specified\n");
+                    std::string error = "Error: no database selected or specified\n";
+                    client.send(error);
+                    std::cerr << "[Entrypoint] Sent error: " << error;
                     continue;
                 }
 
@@ -236,14 +334,18 @@ void Entrypoint::handleClient(int client_fd) {
                     std::lock_guard<std::mutex> lock(mutex_);
                     auto it = db_to_storage_.find(db_name);
                     if (it == db_to_storage_.end()) {
-                        client.send("Error: database '" + db_name + "' not found\n");
+                        std::string error = "Error: database '" + db_name + "' not found\n";
+                        client.send(error);
+                        std::cerr << "[Entrypoint] Sent error: " << error;
                         continue;
                     }
                     target = it->second;
                 }
 
+                std::cerr << "[Entrypoint] Forwarding SQL to storage: " << target.first << ":" << target.second << std::endl;
                 std::string response = forwardToStorage(target.first, target.second, command);
                 client.send(response);
+                std::cerr << "[Entrypoint] Response sent to client" << std::endl;
             }
         } catch (const std::exception& e) {
             std::cerr << "Client handler error: " << e.what() << std::endl;
@@ -251,5 +353,5 @@ void Entrypoint::handleClient(int client_fd) {
         }
     }
     client.close();
+    std::cerr << "[Entrypoint] Client disconnected, fd=" << client_fd << std::endl;
 }
-

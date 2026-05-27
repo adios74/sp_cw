@@ -1,4 +1,8 @@
 #include "../include/Network.h"
+#include <cstring>   // для strerror
+#include <cerrno>    // для errno
+#include <ostream>
+#include <iostream>
 
 Socket::Socket() : fd_(-1) {}
 
@@ -44,18 +48,31 @@ int Socket::accept() {
 }
 
 void Socket::connect(const std::string& host, int port) {
+    std::cerr << "[Socket] connect() called: host=" << host << ", port=" << port << std::endl;
+    
     fd_ = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd_ < 0) throw std::runtime_error("socket creation failed");
+    if (fd_ < 0) {
+        std::cerr << "[Socket] socket() failed: " << strerror(errno) << std::endl;
+        throw std::runtime_error("socket creation failed");
+    }
+    std::cerr << "[Socket] socket() created, fd=" << fd_ << std::endl;
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
-    if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) <= 0)
+    if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) <= 0) {
+        std::cerr << "[Socket] inet_pton() failed for host: " << host << std::endl;
         throw std::runtime_error("invalid address");
+    }
+    std::cerr << "[Socket] Address resolved" << std::endl;
 
-    if (::connect(fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0)
+    std::cerr << "[Socket] Calling ::connect()..." << std::endl;
+    if (::connect(fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        std::cerr << "[Socket] ::connect() failed: " << strerror(errno) << std::endl;
         throw std::runtime_error("connect failed");
+    }
+    std::cerr << "[Socket] ::connect() succeeded!" << std::endl;
 }
 
 void Socket::send(const std::string& msg) {
