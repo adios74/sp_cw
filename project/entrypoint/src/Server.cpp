@@ -101,14 +101,14 @@ void Server::handleClient(int client_fd) {
                 bool success = true;
                 std::string error_msg;
                 std::string upper;
-                bool is_use = false;  // <-- флаг для команды USE
+                bool is_use = false;
 
                 try {
                     upper = command_no_semicolon;
                     std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
 
                     if (upper.find("USE ") == 0) {
-                        is_use = true;   // запоминаем, что это USE
+                        is_use = true;
                         std::string db = command_no_semicolon.substr(4);
                         db.erase(0, db.find_first_not_of(" \t"));
                         if (dbms_->useDatabase(db))
@@ -140,10 +140,14 @@ void Server::handleClient(int client_fd) {
 
                 std::string response = out.str();
 
-                // Добавляем метрики только если команда не USE и их ещё нет в ответе
-                if (response.find("METRICS:") == std::string::npos && !is_use) {
+                if (!is_use) {
                     nlohmann::json metrics = telemetry_.getMetricsJson();
-                    response += "\nMETRICS: " + metrics.dump(4);
+                    std::ofstream metrics_file(db_root_ + "/metrics.log", std::ios::app);
+                    if (metrics_file.is_open()) {
+                        metrics_file << metrics.dump() << std::endl;
+                    } else {
+                        std::cerr << "[Storage] Failed to open metrics log file" << std::endl;
+                    }
                 }
 
                 std::cerr << "[Storage] Sending response: " << response << std::endl;
