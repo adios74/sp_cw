@@ -682,7 +682,10 @@ void Entrypoint::handleClient(int client_fd) {
                         target = it->second;
                     }
 
-                    std::string full_sql = "USE " + async_db + "; " + async_sql;
+std::string full_sql = "USE " + async_db + "; " + async_sql;
+if (!full_sql.empty() && full_sql.back() != ';') {
+    full_sql += ';';
+}
                     std::string task_id = task_manager_->enqueue(full_sql, target.first, target.second);
                     client.send("TASK " + task_id + "\n");
                     continue;

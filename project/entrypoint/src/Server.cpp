@@ -104,19 +104,22 @@ void Server::handleClient(int client_fd) {
                     std::string upper = command_no_semicolon;
                     std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
 
-                    if (upper.find("USE ") == 0) {
-                        std::string db = command_no_semicolon.substr(4);
-                        db.erase(0, db.find_first_not_of(" \t"));
-                        if (dbms_->useDatabase(db))
-                            out << "Using database " << db << std::endl;
-                        else
-                            out << "Error: Database '" << db << "' not found" << std::endl;
-                    } else {
-                        Lexer lexer(command_no_semicolon);
-                        Parser parser(lexer);
-                        Statement stmt = parser.parseStatement();
-                        executor.execute(stmt);
-                    }
+// В методе Server::handleClient, блок обработки USE:
+
+if (upper.find("USE ") == 0) {
+    std::string db = command_no_semicolon.substr(4);
+    db.erase(0, db.find_first_not_of(" \t\n\r"));
+    if (!dbms_->useDatabase(db)) {
+        out << "Error: Database '" << db << "' not found" << std::endl;
+    }
+    // Успешный USE не генерирует вывод — сообщение отправляется только 
+    // при явной команде пользователя через Entrypoint
+} else {
+    Lexer lexer(command_no_semicolon);
+    Parser parser(lexer);
+    Statement stmt = parser.parseStatement();
+    executor.execute(stmt);
+}
                 } catch (const std::exception& ex) {
                     success = false;
                     error_msg = ex.what();
