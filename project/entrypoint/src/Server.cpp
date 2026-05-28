@@ -4,6 +4,8 @@
 #include "Parser.h"
 #include <iostream>
 #include <sstream>
+#include <algorithm>
+#include <cctype>
 
 Server::Server(int port, const std::string& db_root)
     : port_(port), db_root_(db_root), running_(false), server_fd_(-1) {
@@ -20,20 +22,21 @@ void Server::start() {
     Socket listener;
     listener.bind(port_);
     listener.listen();
-    server_fd_ = listener.getFd(); // сохраняем для возможности остановки
+    server_fd_ = listener.getFd();
     running_ = true;
     std::cout << "Server listening on port " << port_ << std::endl;
     std::cout << "Access log: " << db_root_ + "/access.log" << std::endl;
 
     while (running_) {
         try {
+            std::cerr << "[Storage] DEBUG: Waiting for accept on port " << port_ << "..." << std::endl;
             int client_fd = listener.accept();
+            std::cerr << "[Storage] DEBUG: Accepted connection, fd=" << client_fd << std::endl;
             client_threads_.emplace_back(&Server::handleClient, this, client_fd);
         } catch (const std::exception& e) {
             if (running_) std::cerr << "Accept error: " << e.what() << std::endl;
         }
     }
-    // Ждём завершения всех клиентских потоков
     for (auto& t : client_threads_) {
         if (t.joinable()) t.join();
     }
@@ -50,6 +53,9 @@ void Server::stop() {
 void Server::handleClient(int client_fd) {
     Socket client;
     client.setFd(client_fd);
+    
+    std::cerr << "[Storage] New connection, fd=" << client_fd << std::endl;
+    
     SQLExecutor executor(*dbms_);
     std::string buffer;
     std::string client_id = "client_" + std::to_string(client_fd);
@@ -107,10 +113,15 @@ void Server::handleClient(int client_fd) {
 
                 client.send(response);
             }
-        } catch (const std::exception& e) {
-            std::cerr << "Client handler error: " << e.what() << std::endl;
-            break;
+        } catch (const std::exception& ex) {
+            out << "Error: " << ex.what() << std::endl;
         }
+        
+        std::cout.rdbuf(old_cout);
+        accumulated_output += out.str();
     }
-    client.close();
+    
+    std::cerr << "[Storage] Sending response: " << accumulated_output << std::endl;
+    client.send(accumulated_output);
+    std::cerr << "[Storage] Response sent, closing connection" << std::endl;
 }
