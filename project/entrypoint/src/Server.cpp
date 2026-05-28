@@ -2,11 +2,15 @@
 #include "Network.h"
 #include "Lexer.h"
 #include "Parser.h"
+#include "../../storage_node/include/DbEngine.h"        // добавлено
 #include <iostream>
 #include <sstream>
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <filesystem>
+
+namespace fs = std::filesystem;
 
 Server::Server(int port, const std::string& db_root)
     : port_(port), db_root_(db_root), running_(false), server_fd_(-1) {
