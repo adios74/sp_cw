@@ -113,8 +113,6 @@ void Entrypoint::removeStorageNode(const std::string& host, int port) {
     std::cout << "Storage node removed: " << host << ":" << port << std::endl;
 }
 
-// ==================== Приватные методы ====================
-
 std::string Entrypoint::forwardToStorage(const std::string& host, int port, const std::string& sql) {
     std::cerr << "[Entrypoint] ========== FORWARDING TO STORAGE ==========" << std::endl;
     std::cerr << "[Entrypoint] Host: " << host << std::endl;

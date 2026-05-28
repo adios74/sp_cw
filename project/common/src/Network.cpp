@@ -49,8 +49,14 @@ int Socket::accept() {
 }
 
 void Socket::connect(const std::string& host, int port) {
+    std::cerr << "[Socket] connect() called: host=" << host << ", port=" << port << std::endl;
+    
     fd_ = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd_ < 0) throw std::runtime_error("socket creation failed");
+    if (fd_ < 0) {
+        std::cerr << "[Socket] socket() failed: " << strerror(errno) << std::endl;
+        throw std::runtime_error("socket creation failed");
+    }
+    std::cerr << "[Socket] socket() created, fd=" << fd_ << std::endl;
 
     // Неблокирующий режим для таймаута
     int flags = fcntl(fd_, F_GETFL, 0);

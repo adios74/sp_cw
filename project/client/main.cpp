@@ -57,7 +57,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Режим Entrypoint
+    // --- Режим Entrypoint ---
     if (argc >= 2 && std::string(argv[1]) == "--entrypoint") {
         int port = 8080;
         if (argc >= 3) port = std::stoi(argv[2]);
@@ -66,7 +66,6 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    // Режим Storage-сервера
     if (argc >= 2 && std::string(argv[1]) == "--server") {
         int port = 12345;
         std::string db_path = "./database_data";

@@ -58,6 +58,9 @@ void Server::stop() {
 void Server::handleClient(int client_fd) {
     Socket client;
     client.setFd(client_fd);
+    
+    std::cerr << "[Storage] New connection, fd=" << client_fd << std::endl;
+    
     SQLExecutor executor(*dbms_);
     std::string buffer;
     std::string client_id = "client_" + std::to_string(client_fd);
@@ -149,10 +152,12 @@ if (upper != "STATUS" && upper.find("STATUS ") != 0) {
 std::cerr << "[Storage] Sending response: " << response << std::endl;
 client.send(response);
             }
-        } catch (const std::exception& e) {
-            std::cerr << "Client handler error: " << e.what() << std::endl;
-            break;
+        } catch (const std::exception& ex) {
+            out << "Error: " << ex.what() << std::endl;
         }
+        
+        std::cout.rdbuf(old_cout);
+        accumulated_output += out.str();
     }
     std::cerr << "[Storage] Closing connection, fd=" << client_fd << std::endl;
     client.close();
