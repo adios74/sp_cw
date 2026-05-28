@@ -6,6 +6,8 @@
 #include <vector>
 #include <memory>
 #include "DbEngine.h"
+#include "AccessLog.h"
+#include "Telemetry.h" 
 
 class Server {
 public:
@@ -22,6 +24,9 @@ private:
 	std::vector<std::thread> client_threads_;
 	bool running_;
 	int server_fd_;
+
+	std::unique_ptr<AccessLogger> access_logger_;
+    TelemetryCollector telemetry_;
 };
 
 #endif
