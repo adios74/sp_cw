@@ -10,6 +10,7 @@
 #include <signal.h>
 #include <chrono>
 #include <thread>
+#include <cstring>
 
 // ==================== Конструктор / Деструктор ====================
 
@@ -24,6 +25,13 @@ Entrypoint::Entrypoint(int client_port, const std::string& authFile)
     } else {
         executable_path_ = "./prog";
     }
+
+    task_manager_ = std::make_shared<AsyncTaskManager>(
+        4,
+        [this](const std::string& host, int port, const std::string& sql) -> std::string {
+            return this->forwardToStorage(host, port, sql);
+        }
+    );
 }
 
 Entrypoint::~Entrypoint() { stop(); }
@@ -112,27 +120,23 @@ std::string Entrypoint::forwardToStorage(const std::string& host, int port, cons
     std::cerr << "[Entrypoint] Host: " << host << std::endl;
     std::cerr << "[Entrypoint] Port: " << port << std::endl;
     std::cerr << "[Entrypoint] SQL: " << sql << std::endl;
-    std::cerr << "[Entrypoint] Creating socket..." << std::endl;
 
     Socket sock;
     try {
-        std::cerr << "[Entrypoint] Connecting to " << host << ":" << port << "..." << std::endl;
         sock.connect(host, port);
-        std::cerr << "[Entrypoint] Connected successfully!" << std::endl;
-
         sock.setTimeout(5);
-        std::cerr << "[Entrypoint] Timeout set to 5 seconds" << std::endl;
 
-        std::cerr << "[Entrypoint] Sending SQL (" << sql.size() << " bytes)..." << std::endl;
         sock.send(sql);
-        std::cerr << "[Entrypoint] SQL sent" << std::endl;
-
-        std::cerr << "[Entrypoint] Shutting down write..." << std::endl;
         sock.shutdownWrite();
-        std::cerr << "[Entrypoint] Write shutdown complete" << std::endl;
 
-        std::cerr << "[Entrypoint] Waiting for response..." << std::endl;
-        std::string response = sock.recv();
+        std::string response;
+        char buf[4096];
+        while (true) {
+            ssize_t n = ::recv(sock.getFd(), buf, sizeof(buf) - 1, 0);
+            if (n <= 0) break;
+            buf[n] = '\0';
+            response += buf;
+        }
 
         std::cerr << "[Entrypoint] Response received (" << response.size() << " bytes)" << std::endl;
         std::cerr << "[Entrypoint] Response content: " << response << std::endl;
@@ -149,7 +153,6 @@ std::string Entrypoint::forwardToStorage(const std::string& host, int port, cons
 }
 
 std::pair<std::string, int> Entrypoint::chooseStorageForNewDB() {
-    // Мьютекс уже захвачен вызывающей стороной
     if (storage_nodes_.empty()) {
         throw std::runtime_error("No storage nodes available");
     }
@@ -415,7 +418,6 @@ void Entrypoint::handleClient(int client_fd) {
                         continue;
                     }
 
-                    // CREATE USER "username" "password" [ADMIN]
                     if (upper_cmd.find("CREATE USER") == 0) {
                         std::regex re(R"(CREATE USER\s+\"([^\"]+)\"\s+\"([^\"]+)\"(?:\s+ADMIN)?)");
                         std::smatch m;
@@ -433,7 +435,6 @@ void Entrypoint::handleClient(int client_fd) {
                             client.send("Error: usage CREATE USER \"username\" \"password\" [ADMIN]\n");
                         }
                     }
-                    // CREATE GROUP "groupname"
                     else if (upper_cmd.find("CREATE GROUP") == 0) {
                         std::regex re(R"(CREATE GROUP\s+\"([^\"]+)\")");
                         std::smatch m;
@@ -447,7 +448,6 @@ void Entrypoint::handleClient(int client_fd) {
                             client.send("Error: usage CREATE GROUP \"groupname\"\n");
                         }
                     }
-                    // ADD USER "username" TO GROUP "groupname"
                     else if (upper_cmd.find("ADD USER") == 0) {
                         std::regex re(R"(ADD USER\s+\"([^\"]+)\"\s+TO GROUP\s+\"([^\"]+)\")");
                         std::smatch m;
@@ -461,7 +461,6 @@ void Entrypoint::handleClient(int client_fd) {
                             client.send("Error: usage ADD USER \"username\" TO GROUP \"groupname\"\n");
                         }
                     }
-                    // SET PERMISSION ON "db" FOR USER "username" = <flags>
                     else if (upper_cmd.find("SET PERMISSION ON") == 0 && upper_cmd.find("FOR USER") != std::string::npos) {
                         std::regex re(R"(SET PERMISSION ON\s+\"([^\"]+)\"\s+FOR USER\s+\"([^\"]+)\"\s*=\s*(\d+))");
                         std::smatch m;
@@ -475,7 +474,6 @@ void Entrypoint::handleClient(int client_fd) {
                             client.send("Error: usage SET PERMISSION ON \"db\" FOR USER \"username\" = <flags>\n");
                         }
                     }
-                    // SET PERMISSION ON "db" FOR GROUP "groupname" = <flags>
                     else if (upper_cmd.find("SET PERMISSION ON") == 0 && upper_cmd.find("FOR GROUP") != std::string::npos) {
                         std::regex re(R"(SET PERMISSION ON\s+\"([^\"]+)\"\s+FOR GROUP\s+\"([^\"]+)\"\s*=\s*(\d+))");
                         std::smatch m;
@@ -489,7 +487,6 @@ void Entrypoint::handleClient(int client_fd) {
                             client.send("Error: usage SET PERMISSION ON \"db\" FOR GROUP \"groupname\" = <flags>\n");
                         }
                     }
-                    // SET DEFAULT PERMISSION ON "db" = <flags>
                     else if (upper_cmd.find("SET DEFAULT PERMISSION ON") == 0) {
                         std::regex re(R"(SET DEFAULT PERMISSION ON\s+\"([^\"]+)\"\s*=\s*(\d+))");
                         std::smatch m;
@@ -502,15 +499,12 @@ void Entrypoint::handleClient(int client_fd) {
                             client.send("Error: usage SET DEFAULT PERMISSION ON \"db\" = <flags>\n");
                         }
                     }
-                    // SHOW USERS
                     else if (upper_cmd.find("SHOW USERS") == 0) {
                         client.send(auth_.listUsers());
                     }
-                    // SHOW GROUPS
                     else if (upper_cmd.find("SHOW GROUPS") == 0) {
                         client.send(auth_.listGroups());
                     }
-                    // SHOW PERMISSIONS FOR USER "username"
                     else if (upper_cmd.find("SHOW PERMISSIONS FOR USER") == 0) {
                         std::regex re(R"(SHOW PERMISSIONS FOR USER\s+\"([^\"]+)\")");
                         std::smatch m;
@@ -520,7 +514,6 @@ void Entrypoint::handleClient(int client_fd) {
                             client.send("Error: usage SHOW PERMISSIONS FOR USER \"username\"\n");
                         }
                     }
-                    // SHOW PERMISSIONS FOR GROUP "groupname"
                     else if (upper_cmd.find("SHOW PERMISSIONS FOR GROUP") == 0) {
                         std::regex re(R"(SHOW PERMISSIONS FOR GROUP\s+\"([^\"]+)\")");
                         std::smatch m;
@@ -539,6 +532,7 @@ void Entrypoint::handleClient(int client_fd) {
                 // --- USE ---
                 if (upper_cmd.find("USE ") == 0) {
                     current_db = db_name;
+                    std::cerr << "[Entrypoint] DEBUG: USE command, setting current_db to: " << current_db << std::endl;
                     client.send("Using database " + current_db + "\n");
                     continue;
                 }
@@ -611,7 +605,102 @@ void Entrypoint::handleClient(int client_fd) {
                     continue;
                 }
 
-                // --- Обычные SQL-команды (SELECT, INSERT, UPDATE, DELETE, CREATE/ALTER TABLE и т.д.) ---
+                // --- Асинхронные запросы (ASYNC) ---
+                if (upper_cmd.find("ASYNC ") == 0) {
+                    std::string async_sql = command_no_semicolon.substr(6);
+                    size_t start = async_sql.find_first_not_of(" \t");
+                    if (start != std::string::npos) async_sql = async_sql.substr(start);
+                    if (async_sql.empty()) {
+                        client.send("Error: missing SQL after ASYNC\n");
+                        continue;
+                    }
+
+                    std::string async_db = extractDatabaseName(async_sql, current_db);
+                    
+                    std::cerr << "[Entrypoint] DEBUG ASYNC: async_sql='" << async_sql << "'" << std::endl;
+                    std::cerr << "[Entrypoint] DEBUG ASYNC: async_db='" << async_db << "'" << std::endl;
+                    std::cerr << "[Entrypoint] DEBUG ASYNC: current_db='" << current_db << "'" << std::endl;
+                    std::cerr << "[Entrypoint] DEBUG ASYNC: current_user='" << current_user << "'" << std::endl;
+                    
+                    if (async_db.empty()) {
+                        client.send("Error: no database specified or selected for ASYNC command\n");
+                        continue;
+                    }
+
+                    // Проверка прав доступа
+                    std::string upper_async = async_sql;
+                    std::transform(upper_async.begin(), upper_async.end(), upper_async.begin(), ::toupper);
+                    
+                    // Удаляем начальные пробелы для точной проверки
+                    size_t first_non_space = upper_async.find_first_not_of(" \t\n\r");
+                    if (first_non_space != std::string::npos) {
+                        upper_async = upper_async.substr(first_non_space);
+                    }
+                    
+                    std::cerr << "[Entrypoint] DEBUG ASYNC: upper_async='" << upper_async << "'" << std::endl;
+                    
+                    bool allowed = false;
+                    if (upper_async.find("CREATE TABLE") == 0) {
+                        allowed = auth_.checkPermission(current_user, async_db, Operation::CREATE_TABLE);
+                        std::cerr << "[Entrypoint] DEBUG ASYNC: checking CREATE_TABLE permission" << std::endl;
+                    }
+                    else if (upper_async.find("DROP TABLE") == 0) {
+                        allowed = auth_.checkPermission(current_user, async_db, Operation::DROP_TABLE);
+                        std::cerr << "[Entrypoint] DEBUG ASYNC: checking DROP_TABLE permission" << std::endl;
+                    }
+                    else if (upper_async.find("SELECT") == 0) {
+                        allowed = auth_.checkPermission(current_user, async_db, Operation::READ);
+                        std::cerr << "[Entrypoint] DEBUG ASYNC: checking READ permission" << std::endl;
+                    }
+                    else if (upper_async.find("INSERT") == 0 ||
+                             upper_async.find("UPDATE") == 0 ||
+                             upper_async.find("DELETE") == 0) {
+                        allowed = auth_.checkPermission(current_user, async_db, Operation::WRITE);
+                        std::cerr << "[Entrypoint] DEBUG ASYNC: checking WRITE permission, result=" << allowed << std::endl;
+                    }
+                    else {
+                        std::cerr << "[Entrypoint] DEBUG ASYNC: unsupported command" << std::endl;
+                        client.send("Error: unsupported command for async execution\n");
+                        continue;
+                    }
+
+                    std::cerr << "[Entrypoint] DEBUG ASYNC: permission check result=" << allowed << std::endl;
+
+                    if (!allowed) {
+                        client.send("Error: permission denied for async operation\n");
+                        continue;
+                    }
+
+                    std::pair<std::string, int> target;
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        auto it = db_to_storage_.find(async_db);
+                        if (it == db_to_storage_.end()) {
+                            client.send("Error: database '" + async_db + "' not found\n");
+                            continue;
+                        }
+                        target = it->second;
+                    }
+
+                    std::string full_sql = "USE " + async_db + "; " + async_sql;
+                    std::string task_id = task_manager_->enqueue(full_sql, target.first, target.second);
+                    client.send("TASK " + task_id + "\n");
+                    continue;
+                }
+
+                // --- Проверка статуса асинхронной задачи ---
+                if (upper_cmd.find("STATUS ") == 0) {
+                    std::string task_id = command_no_semicolon.substr(7);
+                    size_t st = task_id.find_first_not_of(" \t");
+                    size_t en = task_id.find_last_not_of(" \t");
+                    if (st != std::string::npos)
+                        task_id = task_id.substr(st, en - st + 1);
+                    std::string json = task_manager_->getStatusJson(task_id);
+                    client.send(json + "\n");
+                    continue;
+                }
+
+                // --- Обычные SQL-команды (синхронные) ---
                 if (db_name.empty()) {
                     client.send("Error: no database selected or specified\n");
                     continue;
@@ -628,7 +717,7 @@ void Entrypoint::handleClient(int client_fd) {
                     target = it->second;
                 }
 
-                // Проверка прав в зависимости от типа команды
+                // Проверка прав для синхронных команд
                 bool allowed = false;
                 if (upper_cmd.find("CREATE TABLE") == 0)
                     allowed = auth_.checkPermission(current_user, db_name, Operation::CREATE_TABLE);
@@ -650,7 +739,6 @@ void Entrypoint::handleClient(int client_fd) {
                     continue;
                 }
 
-                // Отправляем в storage с явным указанием БД (для надёжности)
                 std::string forward_cmd = "USE " + db_name + "; " + command;
                 std::string response = forwardToStorage(target.first, target.second, forward_cmd);
                 client.send(response);
