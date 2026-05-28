@@ -22,10 +22,10 @@ void printHelp() {
     std::cout << "  CREATE TABLE <name> (<col1> TYPE, <col2> TYPE, ...);\n";
     std::cout << "  DROP TABLE <name>;\n";
     std::cout << "  INSERT INTO </td> VALUES (val1, val2, ...);\n";
-    std::cout << "  SELECT * FROM 表 [WHERE condition];\n";
-    std::cout << "  UPDATE 表 SET col = value [WHERE condition];\n";
-    std::cout << "  DELETE FROM 表 [WHERE condition];\n";
-    std::cout << "  REVERT 表 \"yyyy.mm.dd-hh:mm:ss.msmsms\";\n";
+    std::cout << "  SELECT * FROM [WHERE condition];\n";
+    std::cout << "  UPDATE SET col = value [WHERE condition];\n";
+    std::cout << "  DELETE FROM [WHERE condition];\n";
+    std::cout << "  REVERT \"yyyy.mm.dd-hh:mm:ss.msmsms\";\n";
     std::cout << "  EXIT; - quit the program\n";
     std::cout << "========================================\n\n";
 }
