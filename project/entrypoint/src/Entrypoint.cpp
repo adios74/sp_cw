@@ -1,14 +1,42 @@
 #include "Entrypoint.h"
+#include "Auth.h"
 #include <iostream>
 #include <sstream>
 #include <algorithm>
 #include <cctype>
 #include <regex>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <chrono>
+#include <thread>
+#include <cstring>
 
-Entrypoint::Entrypoint(int client_port)
-    : client_port_(client_port), server_fd_(-1), running_(false) {}
+// ==================== Конструктор / Деструктор ====================
+
+Entrypoint::Entrypoint(int client_port, const std::string& authFile)
+    : client_port_(client_port), server_fd_(-1), running_(false), auth_(authFile)
+{
+    char buffer[1024];
+    ssize_t len = readlink("/proc/self/exe", buffer, sizeof(buffer)-1);
+    if (len != -1) {
+        buffer[len] = '\0';
+        executable_path_ = buffer;
+    } else {
+        executable_path_ = "./prog";
+    }
+
+    task_manager_ = std::make_shared<AsyncTaskManager>(
+        4,
+        [this](const std::string& host, int port, const std::string& sql) -> std::string {
+            return this->forwardToStorage(host, port, sql);
+        }
+    );
+}
 
 Entrypoint::~Entrypoint() { stop(); }
+
+// ==================== Публичные методы ====================
 
 void Entrypoint::start() {
     Socket listener;
@@ -18,6 +46,8 @@ void Entrypoint::start() {
     running_ = true;
     std::cout << "Entrypoint listening for clients on port " << client_port_ << std::endl;
 
+    heartbeat_thread_ = std::thread(&Entrypoint::heartbeatLoop, this);
+
     while (running_) {
         try {
             int client_fd = listener.accept();
@@ -26,6 +56,10 @@ void Entrypoint::start() {
             if (running_) std::cerr << "Accept error: " << e.what() << std::endl;
         }
     }
+
+    if (heartbeat_thread_.joinable())
+        heartbeat_thread_.join();
+
     for (auto& t : client_threads_) {
         if (t.joinable()) t.join();
     }
@@ -42,25 +76,33 @@ void Entrypoint::stop() {
 void Entrypoint::addStorageNode(const std::string& host, int port) {
     std::lock_guard<std::mutex> lock(mutex_);
     for (const auto& node : storage_nodes_) {
-        if (node.first == host && node.second == port) {
+        if (node.host == host && node.port == port) {
             std::cerr << "Storage node " << host << ":" << port << " already registered" << std::endl;
             return;
         }
     }
-    storage_nodes_.emplace_back(host, port);
+    std::string db_root;
+    if (host == "127.0.0.1" || host == "localhost") {
+        db_root = "./storage_data_" + std::to_string(port);
+    } else {
+        db_root = "";
+    }
+    storage_nodes_.emplace_back(host, port, db_root);
     std::cout << "Storage node added: " << host << ":" << port << std::endl;
 }
 
 void Entrypoint::removeStorageNode(const std::string& host, int port) {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto it = std::find(storage_nodes_.begin(), storage_nodes_.end(),
-                        std::make_pair(host, port));
+    auto it = std::find_if(storage_nodes_.begin(), storage_nodes_.end(),
+        [&](const StorageNodeInfo& node) {
+            return node.host == host && node.port == port;
+        });
     if (it == storage_nodes_.end()) {
         std::cerr << "Storage node not found: " << host << ":" << port << std::endl;
         return;
     }
     for (auto db_it = db_to_storage_.begin(); db_it != db_to_storage_.end(); ) {
-        if (db_it->second == *it) {
+        if (db_it->second == std::make_pair(it->host, it->port)) {
             std::cout << "Database " << db_it->first << " will be inaccessible (storage removed)" << std::endl;
             db_it = db_to_storage_.erase(db_it);
         } else {
@@ -76,32 +118,28 @@ std::string Entrypoint::forwardToStorage(const std::string& host, int port, cons
     std::cerr << "[Entrypoint] Host: " << host << std::endl;
     std::cerr << "[Entrypoint] Port: " << port << std::endl;
     std::cerr << "[Entrypoint] SQL: " << sql << std::endl;
-    std::cerr << "[Entrypoint] Creating socket..." << std::endl;
-    
+
     Socket sock;
     try {
-        std::cerr << "[Entrypoint] Connecting to " << host << ":" << port << "..." << std::endl;
         sock.connect(host, port);
-        std::cerr << "[Entrypoint] Connected successfully!" << std::endl;
-        
         sock.setTimeout(5);
-        std::cerr << "[Entrypoint] Timeout set to 5 seconds" << std::endl;
-        
-        std::cerr << "[Entrypoint] Sending SQL (" << sql.size() << " bytes)..." << std::endl;
+
         sock.send(sql);
-        std::cerr << "[Entrypoint] SQL sent" << std::endl;
-        
-        std::cerr << "[Entrypoint] Shutting down write..." << std::endl;
         sock.shutdownWrite();
-        std::cerr << "[Entrypoint] Write shutdown complete" << std::endl;
-        
-        std::cerr << "[Entrypoint] Waiting for response..." << std::endl;
-        std::string response = sock.recv();
-        
+
+        std::string response;
+        char buf[4096];
+        while (true) {
+            ssize_t n = ::recv(sock.getFd(), buf, sizeof(buf) - 1, 0);
+            if (n <= 0) break;
+            buf[n] = '\0';
+            response += buf;
+        }
+
         std::cerr << "[Entrypoint] Response received (" << response.size() << " bytes)" << std::endl;
         std::cerr << "[Entrypoint] Response content: " << response << std::endl;
         std::cerr << "[Entrypoint] =========================================" << std::endl;
-        
+
         sock.close();
         return response;
     } catch (const std::exception& e) {
@@ -113,31 +151,20 @@ std::string Entrypoint::forwardToStorage(const std::string& host, int port, cons
 }
 
 std::pair<std::string, int> Entrypoint::chooseStorageForNewDB() {
-    std::cerr << "[Entrypoint] chooseStorageForNewDB: START" << std::endl;
-    std::cerr << "[Entrypoint] chooseStorageForNewDB: mutex locked" << std::endl;
-    std::cerr << "[Entrypoint] chooseStorageForNewDB: storage_nodes_.size() = " << storage_nodes_.size() << std::endl;
-    
     if (storage_nodes_.empty()) {
-        std::cerr << "[Entrypoint] chooseStorageForNewDB: No storage nodes!" << std::endl;
         throw std::runtime_error("No storage nodes available");
     }
-    
-    for (size_t i = 0; i < storage_nodes_.size(); i++) {
-        std::cerr << "[Entrypoint] chooseStorageForNewDB: node[" << i << "] = " 
-                  << storage_nodes_[i].first << ":" << storage_nodes_[i].second << std::endl;
+    std::vector<std::pair<std::string, int>> alive_nodes;
+    for (const auto& node : storage_nodes_) {
+        if (node.alive)
+            alive_nodes.emplace_back(node.host, node.port);
     }
-    
-    std::cerr << "[Entrypoint] chooseStorageForNewDB: next_node_index_ = " << next_node_index_ << std::endl;
-    size_t index = next_node_index_ % storage_nodes_.size();
-    std::cerr << "[Entrypoint] chooseStorageForNewDB: computed index = " << index << std::endl;
-    
-    auto& node = storage_nodes_[index];
-    std::cerr << "[Entrypoint] chooseStorageForNewDB: selected node = " << node.first << ":" << node.second << std::endl;
-    
+    if (alive_nodes.empty()) {
+        throw std::runtime_error("No alive storage nodes available");
+    }
+    size_t index = next_node_index_ % alive_nodes.size();
+    auto& node = alive_nodes[index];
     next_node_index_++;
-    std::cerr << "[Entrypoint] chooseStorageForNewDB: next_node_index_ incremented to " << next_node_index_ << std::endl;
-    
-    std::cerr << "[Entrypoint] chooseStorageForNewDB: returning" << std::endl;
     return node;
 }
 
@@ -147,7 +174,7 @@ std::string Entrypoint::extractDatabaseName(const std::string& sql, const std::s
     size_t start = upper.find_first_not_of(" \t\n\r");
     if (start == std::string::npos) return current_db;
     upper = upper.substr(start);
-    
+
     if (upper.starts_with("CREATE DATABASE ") || upper.starts_with("CREATE DATABASE\n")) {
         size_t keyword_end = upper.find_first_not_of(" \t", 15);
         if (keyword_end == std::string::npos) return "";
@@ -155,7 +182,15 @@ std::string Entrypoint::extractDatabaseName(const std::string& sql, const std::s
         if (name_end == std::string::npos) name_end = upper.size();
         return sql.substr(start + keyword_end, name_end - keyword_end);
     }
-    
+
+    if (upper.starts_with("DROP DATABASE ") || upper.starts_with("DROP DATABASE\n")) {
+        size_t keyword_end = upper.find_first_not_of(" \t", 13);
+        if (keyword_end == std::string::npos) return "";
+        size_t name_end = upper.find_first_of(" ;\t\n\r", keyword_end);
+        if (name_end == std::string::npos) name_end = upper.size();
+        return sql.substr(start + keyword_end, name_end - keyword_end);
+    }
+
     if (upper.starts_with("USE ")) {
         size_t p = upper.find_first_of(" \t", 4);
         if (p != std::string::npos) {
@@ -163,7 +198,7 @@ std::string Entrypoint::extractDatabaseName(const std::string& sql, const std::s
         }
         return sql.substr(start + 4);
     }
-    
+
     std::regex db_table_regex(R"(\b([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*))");
     std::smatch match;
     if (std::regex_search(sql, match, db_table_regex)) {
@@ -172,26 +207,107 @@ std::string Entrypoint::extractDatabaseName(const std::string& sql, const std::s
     return current_db;
 }
 
+// ==================== Heartbeat и управление процессами ====================
+
+void Entrypoint::heartbeatLoop() {
+    const int HEARTBEAT_INTERVAL_SEC = 5;
+
+    while (running_) {
+        std::this_thread::sleep_for(std::chrono::seconds(HEARTBEAT_INTERVAL_SEC));
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& node : storage_nodes_) {
+            bool was_alive = node.alive;
+            bool is_alive = checkNodeAlive(node);
+            node.alive = is_alive;
+            node.last_heartbeat = std::chrono::steady_clock::now();
+            if (!is_alive && was_alive) {
+                std::cerr << "[Heartbeat] Storage node " << node.host << ":" << node.port
+                          << " is dead. Attempting restart..." << std::endl;
+                restartStorageNode(node);
+            } else if (is_alive && !was_alive) {
+                std::cout << "[Heartbeat] Storage node " << node.host << ":" << node.port
+                          << " is alive again." << std::endl;
+            }
+        }
+    }
+}
+
+bool Entrypoint::checkNodeAlive(const StorageNodeInfo& node) {
+    Socket test_socket;
+    try {
+        test_socket.connect(node.host, node.port);
+        test_socket.close();
+        return true;
+    } catch (const std::exception& e) {
+        return false;
+    }
+}
+
+void Entrypoint::restartStorageNode(StorageNodeInfo& node) {
+    if (node.host != "127.0.0.1" && node.host != "localhost") {
+        std::cerr << "[Heartbeat] Cannot restart remote node " << node.host << ":" << node.port
+                  << " – only localhost restart is supported." << std::endl;
+        return;
+    }
+
+    if (node.pid > 0) {
+        ::kill(node.pid, SIGTERM);
+        int status;
+        waitpid(node.pid, &status, WNOHANG);
+        node.pid = 0;
+    }
+
+    startStorageProcess(node);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    node.alive = checkNodeAlive(node);
+    if (node.alive) {
+        std::cout << "[Heartbeat] Successfully restarted storage node " << node.host << ":" << node.port << std::endl;
+    } else {
+        std::cerr << "[Heartbeat] Failed to restart storage node " << node.host << ":" << node.port << std::endl;
+    }
+}
+
+void Entrypoint::startStorageProcess(StorageNodeInfo& node) {
+    pid_t pid = fork();
+    if (pid == -1) {
+        std::cerr << "[Heartbeat] Fork failed for storage node " << node.host << ":" << node.port << std::endl;
+        return;
+    }
+    if (pid == 0) {
+        std::string port_str = std::to_string(node.port);
+        const char* args[] = {
+            executable_path_.c_str(),
+            "--server",
+            port_str.c_str(),
+            node.db_root.c_str(),
+            nullptr
+        };
+        execvp(args[0], const_cast<char* const*>(args));
+        std::cerr << "[Heartbeat] execvp failed for " << executable_path_ << std::endl;
+        exit(1);
+    } else {
+        node.pid = pid;
+    }
+}
+
+// ==================== Обработка клиента ====================
+
 void Entrypoint::handleClient(int client_fd) {
     Socket client;
     client.setFd(client_fd);
     std::string buffer;
     std::string current_db;
-    
+    std::string current_user;
+
     std::cerr << "[Entrypoint] New client connected, fd=" << client_fd << std::endl;
-    
+
     while (true) {
         try {
-            std::cerr << "[Entrypoint] Waiting for data from client..." << std::endl;
             std::string request = client.recv();
-            std::cerr << "[Entrypoint] Received " << request.size() << " bytes from client" << std::endl;
-            
-            if (request.empty()) {
-                std::cerr << "[Entrypoint] Empty request, client disconnected" << std::endl;
-                break;
-            }
-            
+            if (request.empty()) break;
             buffer += request;
+
             size_t pos;
             while ((pos = buffer.find(';')) != std::string::npos) {
                 std::string command = buffer.substr(0, pos + 1);
@@ -199,133 +315,395 @@ void Entrypoint::handleClient(int client_fd) {
                 command.erase(0, command.find_first_not_of(" \t\n\r"));
                 command.erase(command.find_last_not_of(" \t\n\r") + 1);
                 if (command.empty()) continue;
-                
-                std::cerr << "[Entrypoint] Processing command: " << command << std::endl;
-                
-                std::string upper_cmd = command;
+
+                std::string command_no_semicolon = command;
+                if (!command_no_semicolon.empty() && command_no_semicolon.back() == ';')
+                    command_no_semicolon.pop_back();
+
+                std::string upper_cmd = command_no_semicolon;
                 std::transform(upper_cmd.begin(), upper_cmd.end(), upper_cmd.begin(), ::toupper);
-                
-                // ADD STORAGE
-                if (upper_cmd.find("ADD STORAGE") == 0) {
-                    std::cerr << "[Entrypoint] ADD STORAGE command" << std::endl;
-                    std::regex add_regex(R"(ADD STORAGE\s+\"([^\"]+):(\d+)\")");
-                    std::smatch m;
-                    if (std::regex_search(command, m, add_regex)) {
-                        std::string host = m[1].str();
-                        int port = std::stoi(m[2].str());
-                        std::cerr << "[Entrypoint] Adding storage: " << host << ":" << port << std::endl;
-                        addStorageNode(host, port);
-                        std::string response = "Storage node added\n";
-                        client.send(response);
-                        std::cerr << "[Entrypoint] Sent: " << response;
+
+                // --- Аутентификация ---
+                if (upper_cmd.find("LOGIN") == 0 && current_user.empty()) {
+                    std::istringstream iss(command_no_semicolon);
+                    std::string cmd, username, password;
+                    iss >> cmd >> username >> password;
+                    std::string token = auth_.login(username, password);
+                    if (token.empty()) {
+                        client.send("Error: authentication failed\n");
                     } else {
-                        std::string error = "Error: usage ADD STORAGE \"host:port\"\n";
-                        client.send(error);
-                        std::cerr << "[Entrypoint] Sent error: " << error;
+                        client.send("TOKEN " + token + "\n");
                     }
                     continue;
                 }
-                
-                // REMOVE STORAGE
-                if (upper_cmd.find("REMOVE STORAGE") == 0) {
-                    std::cerr << "[Entrypoint] REMOVE STORAGE command" << std::endl;
-                    std::regex rem_regex(R"(REMOVE STORAGE\s+\"([^\"]+):(\d+)\")");
-                    std::smatch m;
-                    if (std::regex_search(command, m, rem_regex)) {
-                        std::string host = m[1].str();
-                        int port = std::stoi(m[2].str());
-                        std::cerr << "[Entrypoint] Removing storage: " << host << ":" << port << std::endl;
-                        removeStorageNode(host, port);
-                        client.send("Storage node removed\n");
+
+                if (upper_cmd.find("BEARER ") == 0 && current_user.empty()) {
+                    std::string token = command_no_semicolon.substr(7);
+                    size_t st = token.find_first_not_of(" \t");
+                    size_t en = token.find_last_not_of(" \t");
+                    if (st != std::string::npos)
+                        token = token.substr(st, en - st + 1);
+                    std::string user = auth_.validateToken(token);
+                    if (user.empty()) {
+                        client.send("Error: invalid or expired token\n");
                     } else {
-                        client.send("Error: usage REMOVE STORAGE \"host:port\"\n");
+                        current_user = user;
+                        client.send("OK\n");
                     }
                     continue;
                 }
-                
-                // SHOW STORAGES
-                if (upper_cmd.find("SHOW STORAGES") == 0) {
-                    std::cerr << "[Entrypoint] SHOW STORAGES command" << std::endl;
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    std::stringstream ss;
-                    for (const auto& node : storage_nodes_)
-                        ss << node.first << ":" << node.second << "\n";
-                    std::string response = ss.str();
-                    if (response.empty()) response = "No storage nodes\n";
-                    client.send(response);
-                    std::cerr << "[Entrypoint] Sent storage list: " << response;
+
+                if (current_user.empty()) {
+                    client.send("Error: authentication required (use LOGIN then BEARER)\n");
                     continue;
                 }
 
-                // Extract database name for other commands
-                std::string db_name = extractDatabaseName(command, current_db);
-                std::cerr << "[Entrypoint] Database name: '" << db_name << "'" << std::endl;
+                std::string db_name = extractDatabaseName(command_no_semicolon, current_db);
 
-                // CREATE DATABASE
+                // --- Административные команды (требуют ADMIN) ---
+                if (upper_cmd.find("ADD STORAGE") == 0 ||
+                    upper_cmd.find("REMOVE STORAGE") == 0 ||
+                    upper_cmd.find("SHOW STORAGES") == 0) {
+
+                    if (!auth_.checkPermission(current_user, "", Operation::ADMIN)) {
+                        client.send("Error: administrator privileges required\n");
+                        continue;
+                    }
+
+                    if (upper_cmd.find("ADD STORAGE") == 0) {
+                        std::regex add_regex(R"(ADD STORAGE\s+\"([^\"]+):(\d+)\")");
+                        std::smatch m;
+                        if (std::regex_search(command_no_semicolon, m, add_regex)) {
+                            addStorageNode(m[1].str(), std::stoi(m[2].str()));
+                            client.send("Storage node added\n");
+                        } else {
+                            client.send("Error: usage ADD STORAGE \"host:port\"\n");
+                        }
+                    } else if (upper_cmd.find("REMOVE STORAGE") == 0) {
+                        std::regex rem_regex(R"(REMOVE STORAGE\s+\"([^\"]+):(\d+)\")");
+                        std::smatch m;
+                        if (std::regex_search(command_no_semicolon, m, rem_regex)) {
+                            removeStorageNode(m[1].str(), std::stoi(m[2].str()));
+                            client.send("Storage node removed\n");
+                        } else {
+                            client.send("Error: usage REMOVE STORAGE \"host:port\"\n");
+                        }
+                    } else { // SHOW STORAGES
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        std::stringstream ss;
+                        for (const auto& node : storage_nodes_)
+                            ss << node.host << ":" << node.port
+                               << (node.alive ? " (alive)" : " (dead)") << "\n";
+                        std::string resp = ss.str();
+                        if (resp.empty()) resp = "No storage nodes\n";
+                        client.send(resp);
+                    }
+                    continue;
+                }
+
+                // --- Управление пользователями и правами (требуют ADMIN) ---
+                if (upper_cmd.find("CREATE USER") == 0 ||
+                    upper_cmd.find("CREATE GROUP") == 0 ||
+                    upper_cmd.find("ADD USER") == 0 ||
+                    upper_cmd.find("SET PERMISSION ON") == 0 ||
+                    upper_cmd.find("SET DEFAULT PERMISSION ON") == 0 ||
+                    upper_cmd.find("SHOW USERS") == 0 ||
+                    upper_cmd.find("SHOW GROUPS") == 0 ||
+                    upper_cmd.find("SHOW PERMISSIONS") == 0) {
+
+                    if (!auth_.checkPermission(current_user, "", Operation::ADMIN)) {
+                        client.send("Error: administrator privileges required\n");
+                        continue;
+                    }
+
+                    if (upper_cmd.find("CREATE USER") == 0) {
+                        std::regex re(R"(CREATE USER\s+\"([^\"]+)\"\s+\"([^\"]+)\"(?:\s+ADMIN)?)");
+                        std::smatch m;
+                        if (std::regex_search(command_no_semicolon, m, re)) {
+                            std::string user = m[1];
+                            std::string pass = m[2];
+                            bool admin = (command_no_semicolon.find("ADMIN") != std::string::npos);
+                            if (auth_.createUser(user, pass)) {
+                                if (admin) auth_.addUserToGroup(user, "admin");
+                                client.send("User created\n");
+                            } else {
+                                client.send("Error: user already exists\n");
+                            }
+                        } else {
+                            client.send("Error: usage CREATE USER \"username\" \"password\" [ADMIN]\n");
+                        }
+                    }
+                    else if (upper_cmd.find("CREATE GROUP") == 0) {
+                        std::regex re(R"(CREATE GROUP\s+\"([^\"]+)\")");
+                        std::smatch m;
+                        if (std::regex_search(command_no_semicolon, m, re)) {
+                            if (auth_.addGroup(m[1])) {
+                                client.send("Group created\n");
+                            } else {
+                                client.send("Error: group already exists\n");
+                            }
+                        } else {
+                            client.send("Error: usage CREATE GROUP \"groupname\"\n");
+                        }
+                    }
+                    else if (upper_cmd.find("ADD USER") == 0) {
+                        std::regex re(R"(ADD USER\s+\"([^\"]+)\"\s+TO GROUP\s+\"([^\"]+)\")");
+                        std::smatch m;
+                        if (std::regex_search(command_no_semicolon, m, re)) {
+                            if (auth_.addUserToGroup(m[1], m[2])) {
+                                client.send("User added to group\n");
+                            } else {
+                                client.send("Error: user or group not found, or already in group\n");
+                            }
+                        } else {
+                            client.send("Error: usage ADD USER \"username\" TO GROUP \"groupname\"\n");
+                        }
+                    }
+                    else if (upper_cmd.find("SET PERMISSION ON") == 0 && upper_cmd.find("FOR USER") != std::string::npos) {
+                        std::regex re(R"(SET PERMISSION ON\s+\"([^\"]+)\"\s+FOR USER\s+\"([^\"]+)\"\s*=\s*(\d+))");
+                        std::smatch m;
+                        if (std::regex_search(command_no_semicolon, m, re)) {
+                            std::string db = m[1];
+                            std::string user = m[2];
+                            int flags = std::stoi(m[3]);
+                            auth_.setUserDBPermissions(user, db, static_cast<uint8_t>(flags));
+                            client.send("Permissions set\n");
+                        } else {
+                            client.send("Error: usage SET PERMISSION ON \"db\" FOR USER \"username\" = <flags>\n");
+                        }
+                    }
+                    else if (upper_cmd.find("SET PERMISSION ON") == 0 && upper_cmd.find("FOR GROUP") != std::string::npos) {
+                        std::regex re(R"(SET PERMISSION ON\s+\"([^\"]+)\"\s+FOR GROUP\s+\"([^\"]+)\"\s*=\s*(\d+))");
+                        std::smatch m;
+                        if (std::regex_search(command_no_semicolon, m, re)) {
+                            std::string db = m[1];
+                            std::string grp = m[2];
+                            int flags = std::stoi(m[3]);
+                            auth_.setGroupDBPermissions(grp, db, static_cast<uint8_t>(flags));
+                            client.send("Permissions set\n");
+                        } else {
+                            client.send("Error: usage SET PERMISSION ON \"db\" FOR GROUP \"groupname\" = <flags>\n");
+                        }
+                    }
+                    else if (upper_cmd.find("SET DEFAULT PERMISSION ON") == 0) {
+                        std::regex re(R"(SET DEFAULT PERMISSION ON\s+\"([^\"]+)\"\s*=\s*(\d+))");
+                        std::smatch m;
+                        if (std::regex_search(command_no_semicolon, m, re)) {
+                            std::string db = m[1];
+                            int flags = std::stoi(m[2]);
+                            auth_.setDefaultDBPermissions(db, static_cast<uint8_t>(flags));
+                            client.send("Default permissions set\n");
+                        } else {
+                            client.send("Error: usage SET DEFAULT PERMISSION ON \"db\" = <flags>\n");
+                        }
+                    }
+                    else if (upper_cmd.find("SHOW USERS") == 0) {
+                        client.send(auth_.listUsers());
+                    }
+                    else if (upper_cmd.find("SHOW GROUPS") == 0) {
+                        client.send(auth_.listGroups());
+                    }
+                    else if (upper_cmd.find("SHOW PERMISSIONS FOR USER") == 0) {
+                        std::regex re(R"(SHOW PERMISSIONS FOR USER\s+\"([^\"]+)\")");
+                        std::smatch m;
+                        if (std::regex_search(command_no_semicolon, m, re)) {
+                            client.send(auth_.getUserPermissions(m[1]));
+                        } else {
+                            client.send("Error: usage SHOW PERMISSIONS FOR USER \"username\"\n");
+                        }
+                    }
+                    else if (upper_cmd.find("SHOW PERMISSIONS FOR GROUP") == 0) {
+                        std::regex re(R"(SHOW PERMISSIONS FOR GROUP\s+\"([^\"]+)\")");
+                        std::smatch m;
+                        if (std::regex_search(command_no_semicolon, m, re)) {
+                            client.send(auth_.getGroupPermissions(m[1]));
+                        } else {
+                            client.send("Error: usage SHOW PERMISSIONS FOR GROUP \"groupname\"\n");
+                        }
+                    }
+                    else {
+                        client.send("Use: SHOW PERMISSIONS FOR USER \"name\" or FOR GROUP \"name\"\n");
+                    }
+                    continue;
+                }
+
+                // --- USE ---
+                if (upper_cmd.find("USE ") == 0) {
+                    current_db = db_name;
+                    std::cerr << "[Entrypoint] DEBUG: USE command, setting current_db to: " << current_db << std::endl;
+                    client.send("Using database " + current_db + "\n");
+                    continue;
+                }
+
+                // --- CREATE DATABASE ---
                 if (upper_cmd.find("CREATE DATABASE") == 0) {
-                    std::cerr << "[Entrypoint] CREATE DATABASE detected" << std::endl;
-                    std::cerr << "[Entrypoint] db_name = '" << db_name << "'" << std::endl;
-                    std::cerr << "[Entrypoint] db_name.empty() = " << db_name.empty() << std::endl;
-                    
+                    if (!auth_.checkPermission(current_user, "", Operation::CREATE_DATABASE)) {
+                        client.send("Error: permission denied (CREATE DATABASE)\n");
+                        continue;
+                    }
                     if (db_name.empty()) {
-                        std::cerr << "[Entrypoint] Database name is empty, sending error" << std::endl;
                         client.send("Error: invalid database name\n");
                         continue;
                     }
-                    
-                    std::cerr << "[Entrypoint] Acquiring mutex lock..." << std::endl;
+
                     std::pair<std::string, int> target;
                     {
                         std::lock_guard<std::mutex> lock(mutex_);
-                        std::cerr << "[Entrypoint] Mutex lock acquired" << std::endl;
-                        
-                        std::cerr << "[Entrypoint] Checking if database exists: " << db_name << std::endl;
                         if (db_to_storage_.count(db_name)) {
-                            std::cerr << "[Entrypoint] Database already exists!" << std::endl;
                             client.send("Error: database already exists\n");
                             continue;
                         }
-                        
-                        std::cerr << "[Entrypoint] Checking storage_nodes_.empty() = " << storage_nodes_.empty() << std::endl;
                         if (storage_nodes_.empty()) {
-                            std::cerr << "[Entrypoint] No storage nodes available!" << std::endl;
                             client.send("Error: no storage nodes available\n");
                             continue;
                         }
-                        
-                        std::cerr << "[Entrypoint] Calling chooseStorageForNewDB()..." << std::endl;
-                        target = chooseStorageForNewDB();
-                        std::cerr << "[Entrypoint] Storage chosen: " << target.first << ":" << target.second << std::endl;
-                        
+                        try {
+                            target = chooseStorageForNewDB();
+                        } catch (const std::runtime_error& e) {
+                            client.send(std::string("Error: ") + e.what() + "\n");
+                            continue;
+                        }
                         db_to_storage_[db_name] = target;
-                        std::cerr << "[Entrypoint] Database mapped to storage" << std::endl;
                     }
-                    std::cerr << "[Entrypoint] Mutex released" << std::endl;
-                    
-                    std::cerr << "[Entrypoint] Calling forwardToStorage..." << std::endl;
                     std::string response = forwardToStorage(target.first, target.second, command);
-                    std::cerr << "[Entrypoint] forwardToStorage returned, response size=" << response.size() << std::endl;
-                    std::cerr << "[Entrypoint] Response content: " << response << std::endl;
+                    client.send(response);
+                    continue;
+                }
+
+                // --- DROP DATABASE ---
+                if (upper_cmd.find("DROP DATABASE") == 0) {
+                    if (!auth_.checkPermission(current_user, db_name, Operation::DELETE_DATABASE)) {
+                        client.send("Error: permission denied (DROP DATABASE)\n");
+                        continue;
+                    }
+                    if (db_name.empty()) {
+                        client.send("Error: no database specified\n");
+                        continue;
+                    }
+
+                    std::pair<std::string, int> target;
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        auto it = db_to_storage_.find(db_name);
+                        if (it == db_to_storage_.end()) {
+                            client.send("Error: database not found\n");
+                            continue;
+                        }
+                        target = it->second;
+                    }
+
+                    std::string response = forwardToStorage(target.first, target.second, command);
+                    if (response.find("Database dropped") != std::string::npos ||
+                        response.find("dropped") != std::string::npos) {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        db_to_storage_.erase(db_name);
+                        if (current_db == db_name) current_db.clear();
+                    }
+                    client.send(response);
+                    continue;
+                }
+
+                // --- Асинхронные запросы (ASYNC) ---
+                if (upper_cmd.find("ASYNC ") == 0) {
+                    std::string async_sql = command_no_semicolon.substr(6);
+                    size_t start = async_sql.find_first_not_of(" \t");
+                    if (start != std::string::npos) async_sql = async_sql.substr(start);
+                    if (async_sql.empty()) {
+                        client.send("Error: missing SQL after ASYNC\n");
+                        continue;
+                    }
+
+                    std::string async_db = extractDatabaseName(async_sql, current_db);
                     
-                    client.send(response);
-                    std::cerr << "[Entrypoint] Response sent to client" << std::endl;
+                    std::cerr << "[Entrypoint] DEBUG ASYNC: async_sql='" << async_sql << "'" << std::endl;
+                    std::cerr << "[Entrypoint] DEBUG ASYNC: async_db='" << async_db << "'" << std::endl;
+                    std::cerr << "[Entrypoint] DEBUG ASYNC: current_db='" << current_db << "'" << std::endl;
+                    std::cerr << "[Entrypoint] DEBUG ASYNC: current_user='" << current_user << "'" << std::endl;
+                    
+                    if (async_db.empty()) {
+                        client.send("Error: no database specified or selected for ASYNC command\n");
+                        continue;
+                    }
+
+                    // Проверка прав доступа
+                    std::string upper_async = async_sql;
+                    std::transform(upper_async.begin(), upper_async.end(), upper_async.begin(), ::toupper);
+                    
+                    // Удаляем начальные пробелы для точной проверки
+                    size_t first_non_space = upper_async.find_first_not_of(" \t\n\r");
+                    if (first_non_space != std::string::npos) {
+                        upper_async = upper_async.substr(first_non_space);
+                    }
+                    
+                    std::cerr << "[Entrypoint] DEBUG ASYNC: upper_async='" << upper_async << "'" << std::endl;
+                    
+                    bool allowed = false;
+                    if (upper_async.find("CREATE TABLE") == 0) {
+                        allowed = auth_.checkPermission(current_user, async_db, Operation::CREATE_TABLE);
+                        std::cerr << "[Entrypoint] DEBUG ASYNC: checking CREATE_TABLE permission" << std::endl;
+                    }
+                    else if (upper_async.find("DROP TABLE") == 0) {
+                        allowed = auth_.checkPermission(current_user, async_db, Operation::DROP_TABLE);
+                        std::cerr << "[Entrypoint] DEBUG ASYNC: checking DROP_TABLE permission" << std::endl;
+                    }
+                    else if (upper_async.find("SELECT") == 0) {
+                        allowed = auth_.checkPermission(current_user, async_db, Operation::READ);
+                        std::cerr << "[Entrypoint] DEBUG ASYNC: checking READ permission" << std::endl;
+                    }
+                    else if (upper_async.find("INSERT") == 0 ||
+                             upper_async.find("UPDATE") == 0 ||
+                             upper_async.find("DELETE") == 0) {
+                        allowed = auth_.checkPermission(current_user, async_db, Operation::WRITE);
+                        std::cerr << "[Entrypoint] DEBUG ASYNC: checking WRITE permission, result=" << allowed << std::endl;
+                    }
+                    else {
+                        std::cerr << "[Entrypoint] DEBUG ASYNC: unsupported command" << std::endl;
+                        client.send("Error: unsupported command for async execution\n");
+                        continue;
+                    }
+
+                    std::cerr << "[Entrypoint] DEBUG ASYNC: permission check result=" << allowed << std::endl;
+
+                    if (!allowed) {
+                        client.send("Error: permission denied for async operation\n");
+                        continue;
+                    }
+
+                    std::pair<std::string, int> target;
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        auto it = db_to_storage_.find(async_db);
+                        if (it == db_to_storage_.end()) {
+                            client.send("Error: database '" + async_db + "' not found\n");
+                            continue;
+                        }
+                        target = it->second;
+                    }
+
+std::string full_sql = "USE " + async_db + "; " + async_sql;
+if (!full_sql.empty() && full_sql.back() != ';') {
+    full_sql += ';';
+}
+                    std::string task_id = task_manager_->enqueue(full_sql, target.first, target.second);
+                    client.send("TASK " + task_id + "\n");
                     continue;
                 }
 
-                // USE
-                if (upper_cmd.find("USE ") == 0) {
-                    current_db = db_name;
-                    std::string response = "Using database " + current_db + "\n";
-                    client.send(response);
-                    std::cerr << "[Entrypoint] Sent: " << response;
+                // --- Проверка статуса асинхронной задачи ---
+                if (upper_cmd.find("STATUS ") == 0) {
+                    std::string task_id = command_no_semicolon.substr(7);
+                    size_t st = task_id.find_first_not_of(" \t");
+                    size_t en = task_id.find_last_not_of(" \t");
+                    if (st != std::string::npos)
+                        task_id = task_id.substr(st, en - st + 1);
+                    std::string json = task_manager_->getStatusJson(task_id);
+                    client.send(json + "\n");
                     continue;
                 }
 
-                // For other SQL commands (SELECT, INSERT, UPDATE, DELETE, etc.)
+                // --- Обычные SQL-команды (синхронные) ---
                 if (db_name.empty()) {
-                    std::string error = "Error: no database selected or specified\n";
-                    client.send(error);
-                    std::cerr << "[Entrypoint] Sent error: " << error;
+                    client.send("Error: no database selected or specified\n");
                     continue;
                 }
 
@@ -334,18 +712,37 @@ void Entrypoint::handleClient(int client_fd) {
                     std::lock_guard<std::mutex> lock(mutex_);
                     auto it = db_to_storage_.find(db_name);
                     if (it == db_to_storage_.end()) {
-                        std::string error = "Error: database '" + db_name + "' not found\n";
-                        client.send(error);
-                        std::cerr << "[Entrypoint] Sent error: " << error;
+                        client.send("Error: database '" + db_name + "' not found\n");
                         continue;
                     }
                     target = it->second;
                 }
 
-                std::cerr << "[Entrypoint] Forwarding SQL to storage: " << target.first << ":" << target.second << std::endl;
-                std::string response = forwardToStorage(target.first, target.second, command);
+                // Проверка прав для синхронных команд
+                bool allowed = false;
+                if (upper_cmd.find("CREATE TABLE") == 0)
+                    allowed = auth_.checkPermission(current_user, db_name, Operation::CREATE_TABLE);
+                else if (upper_cmd.find("DROP TABLE") == 0)
+                    allowed = auth_.checkPermission(current_user, db_name, Operation::DROP_TABLE);
+                else if (upper_cmd.find("SELECT") == 0)
+                    allowed = auth_.checkPermission(current_user, db_name, Operation::READ);
+                else if (upper_cmd.find("INSERT") == 0 ||
+                         upper_cmd.find("UPDATE") == 0 ||
+                         upper_cmd.find("DELETE") == 0)
+                    allowed = auth_.checkPermission(current_user, db_name, Operation::WRITE);
+                else {
+                    client.send("Error: unsupported command\n");
+                    continue;
+                }
+
+                if (!allowed) {
+                    client.send("Error: permission denied\n");
+                    continue;
+                }
+
+                std::string forward_cmd = "USE " + db_name + "; " + command;
+                std::string response = forwardToStorage(target.first, target.second, forward_cmd);
                 client.send(response);
-                std::cerr << "[Entrypoint] Response sent to client" << std::endl;
             }
         } catch (const std::exception& e) {
             std::cerr << "Client handler error: " << e.what() << std::endl;

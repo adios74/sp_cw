@@ -2,55 +2,65 @@
 #define ENTRYPOINT_H
 
 #include <string>
-#include <thread>
 #include <vector>
-#include <unordered_map>
-#include <memory>
+#include <thread>
 #include <mutex>
-#include <deque>
-#include "Network.h"      // предполагается, что Socket уже есть
+#include <memory>
+#include <chrono>
+#include "Auth.h"
+#include "Network.h"
+#include "AsyncQueue.h"
+
+struct StorageNodeInfo {
+    std::string host;
+    int port;
+    std::string db_root;
+    bool alive = false;
+    std::chrono::steady_clock::time_point last_heartbeat;
+    pid_t pid = 0;
+
+    StorageNodeInfo() = default;
+    StorageNodeInfo(const std::string& h, int p, const std::string& root)
+        : host(h), port(p), db_root(root) {}
+};
 
 class Entrypoint {
 public:
-    Entrypoint(int client_port);
+    Entrypoint(int client_port = 8080, const std::string& authFile = "auth.data");
     ~Entrypoint();
 
     void start();
     void stop();
 
-    // Административные команды (можно вызывать и программно)
     void addStorageNode(const std::string& host, int port);
     void removeStorageNode(const std::string& host, int port);
 
 private:
-    void handleClient(int client_fd);
-    
-    // Отправляет SQL-команду на указанный Storage и возвращает ответ
-    std::string forwardToStorage(const std::string& host, int port, const std::string& sql);
-    
-    // Выбирает Storage для новой БД (round-robin)
-    std::pair<std::string, int> chooseStorageForNewDB();
-    
-    // Извлекает имя БД из запроса (USE / квалифицированное имя / сессия)
-    std::string extractDatabaseName(const std::string& sql, const std::string& current_db) const;
-    
-    // Хранилище состояния сессий клиентов
-    struct ClientSession {
-        std::string current_database;
-    };
-
     int client_port_;
     int server_fd_;
     bool running_;
-    
-    // Защищённые мьютексом данные кластера
-    mutable std::mutex mutex_;
-    std::vector<std::pair<std::string, int>> storage_nodes_;        // все узлы
-    size_t next_node_index_ = 0;                                   // для round-robin
-    std::unordered_map<std::string, std::pair<std::string, int>> db_to_storage_; // БД -> (host, port)
-    std::unordered_map<int, ClientSession> sessions_;              // fd -> сессия
-    
+    AuthManager auth_;
+    std::string executable_path_;
+
+    std::vector<StorageNodeInfo> storage_nodes_;
+    std::unordered_map<std::string, std::pair<std::string, int>> db_to_storage_;
+    size_t next_node_index_ = 0;
+
+    std::thread heartbeat_thread_;
     std::vector<std::thread> client_threads_;
+
+    std::mutex mutex_;
+    std::shared_ptr<AsyncTaskManager> task_manager_;
+
+    std::string forwardToStorage(const std::string& host, int port, const std::string& sql);
+    std::pair<std::string, int> chooseStorageForNewDB();
+    std::string extractDatabaseName(const std::string& sql, const std::string& current_db) const;
+
+    void heartbeatLoop();
+    bool checkNodeAlive(const StorageNodeInfo& node);
+    void restartStorageNode(StorageNodeInfo& node);
+    void startStorageProcess(StorageNodeInfo& node);
+    void handleClient(int client_fd);
 };
 
-#endif
+#endif // ENTRYPOINT_H

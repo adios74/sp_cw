@@ -1,8 +1,9 @@
 #include "../include/Network.h"
-#include <cstring>   // для strerror
-#include <cerrno>    // для errno
-#include <ostream>
+#include <cstring>
+#include <cerrno>
 #include <iostream>
+#include <fcntl.h>
+#include <sys/select.h>
 
 Socket::Socket() : fd_(-1) {}
 
@@ -57,22 +58,44 @@ void Socket::connect(const std::string& host, int port) {
     }
     std::cerr << "[Socket] socket() created, fd=" << fd_ << std::endl;
 
+    // Неблокирующий режим для таймаута
+    int flags = fcntl(fd_, F_GETFL, 0);
+    fcntl(fd_, F_SETFL, flags | O_NONBLOCK);
+
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) <= 0) {
-        std::cerr << "[Socket] inet_pton() failed for host: " << host << std::endl;
+        close();
         throw std::runtime_error("invalid address");
     }
-    std::cerr << "[Socket] Address resolved" << std::endl;
 
-    std::cerr << "[Socket] Calling ::connect()..." << std::endl;
-    if (::connect(fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        std::cerr << "[Socket] ::connect() failed: " << strerror(errno) << std::endl;
+    int ret = ::connect(fd_, (struct sockaddr*)&addr, sizeof(addr));
+    if (ret < 0 && errno != EINPROGRESS) {
+        close();
         throw std::runtime_error("connect failed");
     }
-    std::cerr << "[Socket] ::connect() succeeded!" << std::endl;
+    if (ret < 0) {
+        fd_set writefds;
+        FD_ZERO(&writefds);
+        FD_SET(fd_, &writefds);
+        struct timeval tv = {3, 0};  // 3 секунды
+        ret = select(fd_ + 1, nullptr, &writefds, nullptr, &tv);
+        if (ret <= 0) {
+            close();
+            throw std::runtime_error("connect timeout");
+        }
+        int so_error;
+        socklen_t len = sizeof(so_error);
+        getsockopt(fd_, SOL_SOCKET, SO_ERROR, &so_error, &len);
+        if (so_error != 0) {
+            close();
+            throw std::runtime_error("connect error");
+        }
+    }
+    // Возвращаем блокирующий режим
+    fcntl(fd_, F_SETFL, flags);
 }
 
 void Socket::send(const std::string& msg) {
@@ -93,10 +116,9 @@ std::string Socket::recv() {
         if (received <= 0) break;
         buffer[received] = '\0';
         result += buffer;
-        if (received < BUFFER_SIZE - 1) break;
+        if (static_cast<size_t>(received) < BUFFER_SIZE - 1) break;
     }
     return result;
-    
 }
 
 void Socket::shutdownWrite() {
@@ -112,4 +134,3 @@ void Socket::setTimeout(int seconds) {
     setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
-
