@@ -139,7 +139,6 @@ void Server::handleClient(int client_fd) {
                                            start, end, success, error_msg);
 
                 std::string response = out.str();
-
                 if (!is_use) {
                     nlohmann::json metrics = telemetry_.getMetricsJson();
                     std::ofstream metrics_file(db_root_ + "/metrics.log", std::ios::app);
