@@ -177,6 +177,7 @@ std::string Entrypoint::extractDatabaseName(const std::string& sql, const std::s
     if (start == std::string::npos) return current_db;
     upper = upper.substr(start);
 
+    // CREATE DATABASE
     if (upper.starts_with("CREATE DATABASE ") || upper.starts_with("CREATE DATABASE\n")) {
         size_t keyword_end = upper.find_first_not_of(" \t", 15);
         if (keyword_end == std::string::npos) return "";
@@ -185,6 +186,7 @@ std::string Entrypoint::extractDatabaseName(const std::string& sql, const std::s
         return sql.substr(start + keyword_end, name_end - keyword_end);
     }
 
+    // DROP DATABASE
     if (upper.starts_with("DROP DATABASE ") || upper.starts_with("DROP DATABASE\n")) {
         size_t keyword_end = upper.find_first_not_of(" \t", 13);
         if (keyword_end == std::string::npos) return "";
@@ -193,6 +195,7 @@ std::string Entrypoint::extractDatabaseName(const std::string& sql, const std::s
         return sql.substr(start + keyword_end, name_end - keyword_end);
     }
 
+    // USE
     if (upper.starts_with("USE ")) {
         size_t p = upper.find_first_of(" \t", 4);
         if (p != std::string::npos) {
@@ -201,6 +204,30 @@ std::string Entrypoint::extractDatabaseName(const std::string& sql, const std::s
         return sql.substr(start + 4);
     }
 
+    // REVERT TABLE [db.]table TO TIMESTAMP '...'
+    if (upper.starts_with("REVERT TABLE ") || upper.starts_with("REVERT ")) {
+        size_t prefix_len = upper.starts_with("REVERT TABLE ") ? 13 : 7; // length of "REVERT TABLE " or "REVERT "
+        std::string rest = upper.substr(prefix_len);
+        size_t name_start = rest.find_first_not_of(" \t\n\r");
+        if (name_start == std::string::npos) return current_db;
+        rest = rest.substr(name_start);
+        // extract table name up to space or dot
+        size_t dot_pos = rest.find('.');
+        if (dot_pos != std::string::npos) {
+            std::string db_part = rest.substr(0, dot_pos);
+            // validate as identifier (start with alpha or underscore)
+            if (!db_part.empty() && (std::isalpha(db_part[0]) || db_part[0] == '_')) {
+                bool valid = true;
+                for (char c : db_part) {
+                    if (!std::isalnum(c) && c != '_') { valid = false; break; }
+                }
+                if (valid) return db_part;
+            }
+        }
+        return current_db;
+    }
+
+    // generic db.table detection (fallback)
     std::regex db_table_regex(R"(\b([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*))");
     std::smatch match;
     if (std::regex_search(sql, match, db_table_regex)) {
@@ -630,41 +657,33 @@ void Entrypoint::handleClient(int client_fd) {
                     // Проверка прав доступа
                     std::string upper_async = async_sql;
                     std::transform(upper_async.begin(), upper_async.end(), upper_async.begin(), ::toupper);
-                    
-                    // Удаляем начальные пробелы для точной проверки
                     size_t first_non_space = upper_async.find_first_not_of(" \t\n\r");
                     if (first_non_space != std::string::npos) {
                         upper_async = upper_async.substr(first_non_space);
                     }
                     
-                    std::cerr << "[Entrypoint] DEBUG ASYNC: upper_async='" << upper_async << "'" << std::endl;
-                    
                     bool allowed = false;
                     if (upper_async.find("CREATE TABLE") == 0) {
                         allowed = auth_.checkPermission(current_user, async_db, Operation::CREATE_TABLE);
-                        std::cerr << "[Entrypoint] DEBUG ASYNC: checking CREATE_TABLE permission" << std::endl;
                     }
                     else if (upper_async.find("DROP TABLE") == 0) {
                         allowed = auth_.checkPermission(current_user, async_db, Operation::DROP_TABLE);
-                        std::cerr << "[Entrypoint] DEBUG ASYNC: checking DROP_TABLE permission" << std::endl;
                     }
                     else if (upper_async.find("SELECT") == 0) {
                         allowed = auth_.checkPermission(current_user, async_db, Operation::READ);
-                        std::cerr << "[Entrypoint] DEBUG ASYNC: checking READ permission" << std::endl;
                     }
                     else if (upper_async.find("INSERT") == 0 ||
                              upper_async.find("UPDATE") == 0 ||
                              upper_async.find("DELETE") == 0) {
                         allowed = auth_.checkPermission(current_user, async_db, Operation::WRITE);
-                        std::cerr << "[Entrypoint] DEBUG ASYNC: checking WRITE permission, result=" << allowed << std::endl;
+                    }
+                    else if (upper_async.find("REVERT") == 0) {
+                        allowed = auth_.checkPermission(current_user, async_db, Operation::WRITE);
                     }
                     else {
-                        std::cerr << "[Entrypoint] DEBUG ASYNC: unsupported command" << std::endl;
                         client.send("Error: unsupported command for async execution\n");
                         continue;
                     }
-
-                    std::cerr << "[Entrypoint] DEBUG ASYNC: permission check result=" << allowed << std::endl;
 
                     if (!allowed) {
                         client.send("Error: permission denied for async operation\n");
@@ -682,10 +701,10 @@ void Entrypoint::handleClient(int client_fd) {
                         target = it->second;
                     }
 
-std::string full_sql = "USE " + async_db + "; " + async_sql;
-if (!full_sql.empty() && full_sql.back() != ';') {
-    full_sql += ';';
-}
+                    std::string full_sql = "USE " + async_db + "; " + async_sql;
+                    if (!full_sql.empty() && full_sql.back() != ';') {
+                        full_sql += ';';
+                    }
                     std::string task_id = task_manager_->enqueue(full_sql, target.first, target.second);
                     client.send("TASK " + task_id + "\n");
                     continue;
@@ -731,6 +750,8 @@ if (!full_sql.empty() && full_sql.back() != ';') {
                 else if (upper_cmd.find("INSERT") == 0 ||
                          upper_cmd.find("UPDATE") == 0 ||
                          upper_cmd.find("DELETE") == 0)
+                    allowed = auth_.checkPermission(current_user, db_name, Operation::WRITE);
+                else if (upper_cmd.find("REVERT") == 0)
                     allowed = auth_.checkPermission(current_user, db_name, Operation::WRITE);
                 else {
                     client.send("Error: unsupported command\n");
