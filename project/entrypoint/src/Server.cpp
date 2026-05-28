@@ -2,7 +2,7 @@
 #include "Network.h"
 #include "Lexer.h"
 #include "Parser.h"
-#include "../../storage_node/include/DbEngine.h"        // добавлено
+#include "../../storage_node/include/DbEngine.h"
 #include <iostream>
 #include <sstream>
 #include <algorithm>
@@ -13,16 +13,17 @@
 namespace fs = std::filesystem;
 
 Server::Server(int port, const std::string& db_root)
-    : port_(port), db_root_(db_root), running_(false), server_fd_(-1) {
-    if (!fs::exists(db_root)) {
+    : port_(port), db_root_(db_root), running_(false), server_fd_(-1)
+{
+    if (!fs::exists(db_root))
         fs::create_directories(db_root);
-    }
     access_logger_ = std::make_unique<AccessLogger>(db_root + "/access.log");
 }
 
 Server::~Server() { stop(); }
 
-void Server::start() {
+void Server::start()
+{
     dbms_ = std::make_unique<DBMS>(db_root_);
     Socket listener;
     listener.bind(port_);
@@ -30,24 +31,23 @@ void Server::start() {
     server_fd_ = listener.getFd();
     running_ = true;
     std::cout << "Storage server listening on port " << port_ << std::endl;
-    std::cerr << "[Storage] DEBUG: Server started on port " << port_ << ", fd=" << server_fd_ << std::endl;
+    std::cout << "Access log: " << db_root_ + "/access.log" << std::endl;
 
     while (running_) {
         try {
-            std::cerr << "[Storage] DEBUG: Waiting for accept on port " << port_ << "..." << std::endl;
             int client_fd = listener.accept();
-            std::cerr << "[Storage] DEBUG: Accepted connection, fd=" << client_fd << std::endl;
             client_threads_.emplace_back(&Server::handleClient, this, client_fd);
         } catch (const std::exception& e) {
             if (running_) std::cerr << "Accept error: " << e.what() << std::endl;
         }
     }
-    for (auto& t : client_threads_) {
+
+    for (auto& t : client_threads_)
         if (t.joinable()) t.join();
-    }
 }
 
-void Server::stop() {
+void Server::stop()
+{
     running_ = false;
     if (server_fd_ != -1) {
         ::close(server_fd_);
@@ -55,27 +55,18 @@ void Server::stop() {
     }
 }
 
-void Server::handleClient(int client_fd) {
+void Server::handleClient(int client_fd)
+{
     Socket client;
     client.setFd(client_fd);
-    
-    std::cerr << "[Storage] New connection, fd=" << client_fd << std::endl;
-    
     SQLExecutor executor(*dbms_);
     std::string buffer;
     std::string client_id = "client_" + std::to_string(client_fd);
 
-    std::cerr << "[Storage] New connection, fd=" << client_fd << std::endl;
-
     while (true) {
         try {
-            std::cerr << "[Storage] Waiting for data..." << std::endl;
             std::string request = client.recv();
-            if (request.empty()) {
-                std::cerr << "[Storage] No data received or connection closed" << std::endl;
-                break;
-            }
-            std::cerr << "[Storage] Received " << request.size() << " bytes: " << request << std::endl;
+            if (request.empty()) break;
 
             buffer += request;
             size_t pos;
@@ -90,75 +81,65 @@ void Server::handleClient(int client_fd) {
                 if (!command_no_semicolon.empty() && command_no_semicolon.back() == ';')
                     command_no_semicolon.pop_back();
 
-                std::cerr << "[Storage] Processing command: " << command_no_semicolon << std::endl;
+                telemetry_.recordQueryStart();
+                auto start_time = std::chrono::system_clock::now();
+                auto exec_start = TelemetryCollector::Clock::now();
 
-                // Начало замера и телеметрии
-// Начало замера и телеметрии
-telemetry_.recordQueryStart();
-auto start = std::chrono::system_clock::now();
-auto exec_start = TelemetryCollector::Clock::now();
+                std::stringstream out;
+                auto old_cout = std::cout.rdbuf(out.rdbuf());
+                auto old_cerr = std::cerr.rdbuf(out.rdbuf());
 
-std::stringstream out;
-auto old_cout = std::cout.rdbuf(out.rdbuf());
-auto old_cerr = std::cerr.rdbuf(out.rdbuf());  // ловим и ошибки
+                bool success = true;
+                std::string error_msg;
+                std::string upper;
 
-bool success = true;
-std::string error_msg;
-std::string upper; // объявляем здесь, чтобы была доступна после catch
+                try {
+                    upper = command_no_semicolon;
+                    std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
 
-try {
-    upper = command_no_semicolon;
-    std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
+                    if (upper.find("USE ") == 0) {
+                        std::string db = command_no_semicolon.substr(4);
+                        db.erase(0, db.find_first_not_of(" \t"));
+                        if (dbms_->useDatabase(db))
+                            out << "Using database " << db << std::endl;
+                        else
+                            out << "Error: Database '" << db << "' not found" << std::endl;
+                    } else {
+                        Lexer lexer(command_no_semicolon);
+                        Parser parser(lexer);
+                        Statement stmt = parser.parseStatement();
+                        executor.execute(stmt);
+                    }
+                } catch (const std::exception& ex) {
+                    success = false;
+                    error_msg = ex.what();
+                    out << "Error: " << ex.what() << std::endl;
+                }
 
-    if (upper.find("USE ") == 0) {
-        std::string db = command_no_semicolon.substr(4);
-        db.erase(0, db.find_first_not_of(" \t"));
-        if (dbms_->useDatabase(db))
-            out << "Using database " << db << std::endl;
-        else
-            out << "Error: Database '" << db << "' not found" << std::endl;
-    } else {
-        Lexer lexer(command_no_semicolon);
-        Parser parser(lexer);
-        Statement stmt = parser.parseStatement();
-        executor.execute(stmt);
-    }
-} catch (const std::exception& ex) {
-    success = false;
-    error_msg = ex.what();
-    out << "Error: " << ex.what() << std::endl;
-}
+                std::cout.rdbuf(old_cout);
+                std::cerr.rdbuf(old_cerr);
 
-std::cout.rdbuf(old_cout);
-std::cerr.rdbuf(old_cerr);
+                auto exec_end = TelemetryCollector::Clock::now();
+                telemetry_.recordQueryEnd(exec_end - exec_start, !success);
 
-auto exec_end = TelemetryCollector::Clock::now();
-telemetry_.recordQueryEnd(exec_end - exec_start, !success);
+                auto end_time = std::chrono::system_clock::now();
+                access_logger_->logRequest(command_no_semicolon, client_id,
+                                           "handler_" + std::to_string(client_fd),
+                                           start_time, end_time, success, error_msg);
 
-auto end = std::chrono::system_clock::now();
-// Логирование запроса
-access_logger_->logRequest(command_no_semicolon, client_id,
-                           "handler_" + std::to_string(client_fd),
-                           start, end, success, error_msg);
+                std::string response = out.str();
 
-// Формируем ответ: результат + метрики
-std::string response = out.str();
+                if (upper != "STATUS" && upper.find("STATUS ") != 0) {
+                    nlohmann::json metrics = telemetry_.getMetricsJson();
+                    response += "\nMETRICS: " + metrics.dump(4);
+                }
 
-// Не добавляем отладочную информацию для команды STATUS
-if (upper != "STATUS" && upper.find("STATUS ") != 0) {
-    nlohmann::json metrics = telemetry_.getMetricsJson();
-    response += "\nMETRICS: " + metrics.dump(4);
-}
-std::cerr << "[Storage] Sending response: " << response << std::endl;
-client.send(response);
+                client.send(response);
             }
-        } catch (const std::exception& ex) {
-            out << "Error: " << ex.what() << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "Client handler error: " << e.what() << std::endl;
+            break;
         }
-        
-        std::cout.rdbuf(old_cout);
-        accumulated_output += out.str();
     }
-    std::cerr << "[Storage] Closing connection, fd=" << client_fd << std::endl;
     client.close();
 }
